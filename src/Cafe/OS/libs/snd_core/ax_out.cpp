@@ -2,6 +2,7 @@
 #include "Cafe/OS/libs/snd_core/ax_internal.h"
 #include "Cafe/HW/MMU/MMU.h"
 #include "audio/IAudioAPI.h"
+#include "input/TAS/TASInput.h"
 //#include "ax.h"
 #include "config/CemuConfig.h"
 
@@ -394,6 +395,11 @@ namespace snd_core
 
 	uint32 numQueuedFramesSndGeneric = 0;
 
+	void AXOut_resyncFrameQueue()
+	{
+		numQueuedFramesSndGeneric = snd_core::getNumProcessedFrames();
+	}
+
 	void AXOut_init()
 	{
 
@@ -482,6 +488,12 @@ namespace snd_core
 		constexpr static auto kWaitDurationFast = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::microseconds(2900));
 		constexpr static auto kWaitDurationMinimum = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::microseconds(1700));
 
+		if (TasInput::IsFrameAdvancePaused() && !TasInput::IsFrameAdvanceStepActive())
+		{
+			AXOut_updateDevicePlayState(false);
+			return;
+		}
+
 		// if we haven't buffered any blocks, we will wait less time than usual
 		bool additional_blocks_required = false;
 		{
@@ -520,13 +532,27 @@ namespace snd_core
 
 		if (snd_core::isInitialized())
 		{
-			if (numQueuedFramesSndGeneric == snd_core::getNumProcessedFrames())
+			const uint32 processedFrames = snd_core::getNumProcessedFrames();
+			if (numQueuedFramesSndGeneric <= processedFrames)
 			{
+				// Recover gracefully from counter drift after events like state loads.
+				// Requiring exact equality can permanently stall audio output.
+				if (numQueuedFramesSndGeneric < processedFrames)
+					numQueuedFramesSndGeneric = processedFrames;
 				AXOut_updateDevicePlayState(true);
-				snd_core::AXIst_QueueFrame();
-				numQueuedFramesSndGeneric++;
+				if (snd_core::AXIst_QueueFrame())
+				{
+					numQueuedFramesSndGeneric++;
+				}
+				else
+				{
+					// Keep queue accounting in sync if frame submit fails to
+					// avoid permanently stalling audio after state-load races.
+					numQueuedFramesSndGeneric = processedFrames;
+				}
 			}
 		}
 	}
 
 }
+
