@@ -6,11 +6,13 @@
 #include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
 #include "Cafe/OS/libs/TCL/TCL.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
+#include "Cafe/HW/MMU/MMU.h"
 #include "GX2.h"
 #include "GX2_Command.h"
 #include "GX2_Shader.h"
 #include "GX2_Misc.h"
 #include "OS/libs/coreinit/coreinit_MEM.h"
+#include <limits>
 
 namespace GX2
 {
@@ -535,4 +537,53 @@ namespace GX2
 		s_cbBufferIsInternallyAllocated = false;
     }
 
+	void GX2CommandResyncAfterTimelineLoad()
+	{
+		for (uint32 i = 0; i < Espresso::CORE_COUNT; ++i)
+		{
+			s_perCoreCBState[i].bufferPtr = nullptr;
+			s_perCoreCBState[i].bufferSizeInU32s = 0;
+			s_perCoreCBState[i].currentWritePtr = nullptr;
+			s_perCoreCBState[i].isDisplayList = false;
+		}
+
+		if (!s_commandState->commandPoolBase || s_commandState->commandPoolSizeInU32s < 2)
+		{
+			cemuLog_log(LogType::Force, "Timeline GX2 command resync: skipped commandPoolBase={} poolWords={}",
+				(void*)s_commandState->commandPoolBase.GetPtr(), s_commandState->commandPoolSizeInU32s);
+			return;
+		}
+
+		const uint32be* poolBase = s_commandState->commandPoolBase.GetPtr();
+		const uint32 poolSizeInU32s = s_commandState->commandPoolSizeInU32s;
+		const uint32 poolBaseAddr = s_commandState->commandPoolBase.GetMPTR();
+		const uint64 poolSizeBytes64 = (uint64)poolSizeInU32s * sizeof(uint32be);
+		if (poolBaseAddr == MPTR_NULL || poolSizeBytes64 == 0 || poolSizeBytes64 > std::numeric_limits<uint32>::max() ||
+			!memory_isAddressRangeAccessible(poolBaseAddr, (uint32)poolSizeBytes64))
+		{
+			cemuLog_log(LogType::Force, "Timeline GX2 command resync: invalid command pool base=0x{:08x} poolWords={}; resetting state",
+				poolBaseAddr, poolSizeInU32s);
+			GX2CommandResetToDefaultState();
+			return;
+		}
+		stdx::atomic_ref<MEMPTR<uint32be>> gpuReadPtr(s_commandState->gpuCommandReadPtr);
+		gpuReadPtr.store(s_commandState->commandPoolBase);
+
+		stdx::atomic_ref<uint64be> submissionTimestamp(s_commandState->lastSubmissionTime);
+		const uint64 retiredTimestamp = GX2GetRetiredTimeStamp();
+		submissionTimestamp.store(retiredTimestamp);
+
+		const uint32 mainCore = std::min<uint32>(sGX2MainCoreIndex, Espresso::CORE_COUNT - 1);
+		auto& mainState = s_perCoreCBState[mainCore];
+		mainState.bufferPtr = const_cast<uint32be*>(poolBase);
+		mainState.bufferSizeInU32s = std::min<uint32>(0x100, poolSizeInU32s - 1);
+		mainState.currentWritePtr = mainState.bufferPtr;
+		mainState.isDisplayList = false;
+		s_mainCoreLastCommandState = mainState;
+
+		cemuLog_log(LogType::Force, "Timeline GX2 command resync: poolBase=0x{:08x} poolWords={} mainCore={} retiredTimestamp={}",
+			s_commandState->commandPoolBase.GetMPTR(), poolSizeInU32s, mainCore, retiredTimestamp);
+	}
+
 }
+
