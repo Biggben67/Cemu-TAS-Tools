@@ -11,6 +11,8 @@
 #include "Cafe/HW/Latte/Core/LatteIndices.h"
 #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
 #include "Cafe/HW/Latte/Core/LattePM4.h"
+#include "input/TAS/TASInput.h"
+#include "Cafe/OS/libs/snd_core/ax.h"
 
 #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
 #include "Cafe/OS/libs/TCL/TCL.h" // TCL currently handles the GPU command ringbuffer
@@ -32,6 +34,46 @@ typedef uint32be* LatteCMDPtr;
 void LatteThread_HandleOSScreen();
 
 void LatteThread_Exit();
+
+inline void LatteCP_HandleFrameAdvanceVisualRefreshPoint()
+{
+	if (!TasInput::IsFrameAdvancePaused())
+		return;
+	if (TasInput::GetPendingFrameAdvanceVisualRefreshPermits() == 0)
+		return;
+	// Drive visual refresh through the regular GX2 swap path in visual-only mode.
+	LatteRenderTarget_itHLESwapScanBuffer();
+}
+
+inline void LatteCP_HandlePausePoint()
+{
+	if (!g_lattePauseRequested.load(std::memory_order_acquire))
+		return;
+
+	g_lattePaused.store(true, std::memory_order_release);
+	while (g_lattePauseRequested.load(std::memory_order_acquire))
+	{
+		if (Latte_GetStopSignal())
+			LatteThread_Exit();
+		static uint64 lastHandledPausedPresentId = 0;
+		const uint64 pausedPresentId = g_lattePausedPresentRequest.load(std::memory_order_acquire);
+		if (pausedPresentId > lastHandledPausedPresentId)
+		{
+			TasInput::RequestFrameAdvanceVisualRefresh(1);
+			LatteRenderTarget_itHLESwapScanBuffer();
+			g_lattePausedPresentCompleted.store(pausedPresentId, std::memory_order_release);
+			lastHandledPausedPresentId = pausedPresentId;
+		}
+		if (TasInput::IsFrameAdvancePaused() && TasInput::GetPendingFrameAdvanceVisualRefreshPermits() > 0)
+		{
+			LatteRenderTarget_itHLESwapScanBuffer();
+		}
+		if (g_renderer)
+			g_renderer->NotifyLatteCommandProcessorIdle();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	g_lattePaused.store(false, std::memory_order_release);
+}
 
 class DrawPassContext
 {
@@ -145,6 +187,9 @@ uint32 LatteCP_readU32Deprc()
 	// no display list active
 	while (true)
 	{
+		LatteCP_HandleFrameAdvanceVisualRefreshPoint();
+		LatteCP_HandlePausePoint();
+
 		uint32 cmdWord;
 		if ( TCL::TCLGPUReadRBWord(cmdWord) )
 			return cmdWord;
@@ -425,6 +470,7 @@ LatteCMDPtr LatteCP_itWaitRegMem(LatteCMDPtr cmd, uint32 nWords)
 		performanceMonitor.gpuTime_fenceTime.beginMeasuring();
 		while (true)
 		{
+			LatteCP_HandlePausePoint();
 			uint32 fenceMemValue = _swapEndianU32(*fencePtr);
 			fenceMemValue &= fenceMask;
 			if (compareOp == GPU7_WAIT_MEM_OP_LESS)
@@ -579,6 +625,7 @@ LatteCMDPtr LatteCP_itMemSemaphore(LatteCMDPtr cmd, uint32 nWords)
 		size_t loopCount = 0;
 		while (true)
 		{
+			LatteCP_HandlePausePoint();
 			uint64le oldVal = semaphoreData->load();
 			if (oldVal == 0)
 			{
@@ -1362,6 +1409,8 @@ void LatteCP_ProcessRingbuffer()
 	uint32be tmpBuffer[128];
 	while (true)
 	{
+		LatteCP_HandlePausePoint();
+
 		uint32 itHeader = LatteCP_readU32Deprc();
 		uint32 itHeaderType = (itHeader >> 30) & 3;
 		if (itHeaderType == 3)
@@ -1922,3 +1971,4 @@ void LatteCP_DebugPrintCmdBuffer(uint32be* bufferPtr, uint32 size)
 	}
 }
 #endif
+
