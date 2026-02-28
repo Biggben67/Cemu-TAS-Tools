@@ -31,6 +31,7 @@
 #include "Cafe/OS/libs/padscore/padscore.h"
 #include "Cafe/OS/libs/camera/camera.h"
 #include "../libs/swkbd/swkbd.h"
+#include <mutex>
 
 struct osFunctionEntry_t
 {
@@ -56,6 +57,44 @@ typedef struct
 
 std::vector<osFunctionEntry_t>* s_osFunctionTable;
 std::vector<osPointerEntry_t> osDataTable;
+std::mutex s_osFunctionTableMutex;
+std::mutex s_osDataTableMutex;
+
+bool osLib_copyCStringSafe(const char* src, std::string& dst, size_t maxLen = 256)
+{
+	if (!src || maxLen == 0)
+		return false;
+
+	dst.clear();
+	dst.reserve(64);
+#if BOOST_OS_WINDOWS
+	__try
+	{
+		for (size_t i = 0; i < maxLen; ++i)
+		{
+			const char c = src[i];
+			if (c == '\0')
+				return !dst.empty();
+			dst.push_back(c);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		dst.clear();
+		return false;
+	}
+#else
+	for (size_t i = 0; i < maxLen; ++i)
+	{
+		const char c = src[i];
+		if (c == '\0')
+			return !dst.empty();
+		dst.push_back(c);
+	}
+#endif
+	dst.clear();
+	return false;
+}
 
 void osLib_generateHashFromName(const char* name, uint32* hashA, uint32* hashB)
 {
@@ -79,14 +118,24 @@ void osLib_generateHashFromName(const char* name, uint32* hashA, uint32* hashB)
 
 void osLib_addFunctionInternal(const char* libraryName, const char* functionName, void(*osFunction)(PPCInterpreter_t* hCPU))
 {
+	if (!osFunction)
+		return;
+
+	std::string safeLibraryName;
+	std::string safeFunctionName;
+	if (!osLib_copyCStringSafe(libraryName, safeLibraryName) || !osLib_copyCStringSafe(functionName, safeFunctionName))
+		return;
+
+	std::lock_guard lock(s_osFunctionTableMutex);
+
 	if (!s_osFunctionTable)
 		s_osFunctionTable = new std::vector<osFunctionEntry_t>(); // replace with static allocation + constinit once we have C++20 available
 	// calculate hash
 	uint32 libHashA, libHashB;
 	uint32 funcHashA, funcHashB;
-	osLib_generateHashFromName(libraryName, &libHashA, &libHashB);
-	osLib_generateHashFromName(functionName, &funcHashA, &funcHashB);
-	std::string hleName = fmt::format("{}.{}", libraryName, functionName);
+	osLib_generateHashFromName(safeLibraryName.c_str(), &libHashA, &libHashB);
+	osLib_generateHashFromName(safeFunctionName.c_str(), &funcHashA, &funcHashB);
+	std::string hleName = fmt::format("{}.{}", safeLibraryName, safeFunctionName);
 	// if entry already exists, update it
 	for (auto& it : *s_osFunctionTable)
 	{
@@ -109,10 +158,19 @@ extern "C" DLLEXPORT void osLib_registerHLEFunction(const char* libraryName, con
 
 sint32 osLib_getFunctionIndex(const char* libraryName, const char* functionName)
 {
+	std::string safeLibraryName;
+	std::string safeFunctionName;
+	if (!osLib_copyCStringSafe(libraryName, safeLibraryName) || !osLib_copyCStringSafe(functionName, safeFunctionName))
+		return -1;
+
+	std::lock_guard lock(s_osFunctionTableMutex);
+
+	if (!s_osFunctionTable)
+		return -1;
 	uint32 libHashA, libHashB;
 	uint32 funcHashA, funcHashB;
-	osLib_generateHashFromName(libraryName, &libHashA, &libHashB);
-	osLib_generateHashFromName(functionName, &funcHashA, &funcHashB);
+	osLib_generateHashFromName(safeLibraryName.c_str(), &libHashA, &libHashB);
+	osLib_generateHashFromName(safeFunctionName.c_str(), &funcHashA, &funcHashB);
 	for (auto& it : *s_osFunctionTable)
 	{
 		if (it.libHashA == libHashA &&
@@ -128,11 +186,18 @@ sint32 osLib_getFunctionIndex(const char* libraryName, const char* functionName)
 
 void osLib_addVirtualPointer(const char* libraryName, const char* functionName, uint32 vPtr)
 {
+	std::string safeLibraryName;
+	std::string safeFunctionName;
+	if (!osLib_copyCStringSafe(libraryName, safeLibraryName) || !osLib_copyCStringSafe(functionName, safeFunctionName))
+		return;
+
+	std::lock_guard lock(s_osDataTableMutex);
+
 	// calculate hash
 	uint32 libHashA, libHashB;
 	uint32 funcHashA, funcHashB;
-	osLib_generateHashFromName(libraryName, &libHashA, &libHashB);
-	osLib_generateHashFromName(functionName, &funcHashA, &funcHashB);
+	osLib_generateHashFromName(safeLibraryName.c_str(), &libHashA, &libHashB);
+	osLib_generateHashFromName(safeFunctionName.c_str(), &funcHashA, &funcHashB);
 	// if entry already exists, update it
 	for (auto& it : osDataTable)
 	{
@@ -157,10 +222,17 @@ void osLib_addVirtualPointer(const char* libraryName, const char* functionName, 
 
 uint32 osLib_getPointer(const char* libraryName, const char* functionName)
 {
+	std::string safeLibraryName;
+	std::string safeFunctionName;
+	if (!osLib_copyCStringSafe(libraryName, safeLibraryName) || !osLib_copyCStringSafe(functionName, safeFunctionName))
+		return 0xFFFFFFFF;
+
+	std::lock_guard lock(s_osDataTableMutex);
+
 	uint32 libHashA, libHashB;
 	uint32 funcHashA, funcHashB;
-	osLib_generateHashFromName(libraryName, &libHashA, &libHashB);
-	osLib_generateHashFromName(functionName, &funcHashA, &funcHashB);
+	osLib_generateHashFromName(safeLibraryName.c_str(), &libHashA, &libHashB);
+	osLib_generateHashFromName(safeFunctionName.c_str(), &funcHashA, &funcHashB);
 	for (auto& it : osDataTable)
 	{
 		if (it.libHashA == libHashA &&
@@ -186,3 +258,4 @@ void osLib_returnFromFunction64(PPCInterpreter_t* hCPU, uint64 returnValue64)
 	hCPU->gpr[4] = (returnValue64>>0)&0xFFFFFFFF;
 	hCPU->instructionPointer = hCPU->spr.LR;
 }
+
