@@ -61,6 +61,10 @@ if(MSVC AND MSVC_VERSION EQUAL 1940)
 	set_target_properties(CemuBin PROPERTIES LINK_FLAGS "/INCREMENTAL:NO")
 endif()
 
+if(MSVC)
+	target_link_options(CemuBin PRIVATE "/MAP:${CMAKE_CURRENT_SOURCE_DIR}/../bin/Cemu_release.map")
+endif()
+
 if(WIN32)
 	target_sources(CemuBin PRIVATE
 	resource/cemu.rc
@@ -170,3 +174,4 @@ endif()
 if (BSD)
 	target_link_libraries(CemuBin PRIVATE execinfo SPIRV-Tools SPIRV-Tools-opt)
 endif()
+
