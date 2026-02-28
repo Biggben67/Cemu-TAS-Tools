@@ -50,6 +50,7 @@ bool LatteTiming_getCustomVsyncFrequency(sint32& customFrequency)
 }
 
 bool s_usingHostDrivenVSync = false;
+HRTick s_lastHostVsync = 0;
 
 void LatteTiming_EnableHostDrivenVSync()
 {
@@ -69,6 +70,16 @@ void LatteTiming_Init()
 	LatteGPUState.timer_frequency = HighResolutionTimer::getFrequency();
 	LatteGPUState.timer_bootUp = HighResolutionTimer::now().getTick();
 	LatteGPUState.timer_nextVSync = LatteGPUState.timer_bootUp + LatteTime_CalculateTimeBetweenVSync();
+	s_lastHostVsync = LatteGPUState.timer_bootUp;
+}
+
+void LatteTiming_RebaseAfterStateLoad()
+{
+	// Rebase GPU timing onto current host time to avoid progressive slowdown after repeated state loads.
+	LatteGPUState.timer_frequency = HighResolutionTimer::getFrequency();
+	LatteGPUState.timer_bootUp = HighResolutionTimer::now().getTick();
+	LatteGPUState.timer_nextVSync = LatteGPUState.timer_bootUp + LatteTime_CalculateTimeBetweenVSync();
+	s_lastHostVsync = LatteGPUState.timer_bootUp;
 }
 
 void LatteTiming_signalVsync()
@@ -120,8 +131,6 @@ void LatteTiming_signalVsync()
 	GX2::__GX2NotifyEvent(GX2::GX2CallbackEventType::VSYNC);
 }
 
-HRTick s_lastHostVsync = 0;
-
 // notify when host vsync event is triggered (on renderer canvas)
 void LatteTiming_NotifyHostVSync()
 {
@@ -171,3 +180,4 @@ void LatteTiming_HandleTimedVsync()
 			LatteGPUState.timer_nextVSync += vsyncTime;
 	}
 }
+
