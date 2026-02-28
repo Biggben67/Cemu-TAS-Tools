@@ -15,6 +15,8 @@
 #include "Cafe/OS/libs/erreula/erreula.h"
 #include "input/InputManager.h"
 #include "Cafe/OS/libs/swkbd/swkbd.h"
+#include "Cafe/OS/libs/snd_core/ax.h"
+#include "input/TAS/TASInput.h"
 
 uint32 prevScissorX = 0;
 uint32 prevScissorY = 0;
@@ -683,21 +685,40 @@ void LatteRenderTarget_trackUpdates()
 
 void LatteRenderTarget_itHLESwapScanBuffer()
 {
-	performanceMonitor.cycle[performanceMonitor.cycleIndex].frameCounter++;
-	if(LatteGPUState.frameCounter > 5)
-		performanceMonitor.gpuTime_frameTime.endMeasuring();
-	LattePerformanceMonitor_frameEnd();
-	LatteGPUState.frameCounter++;
+	bool visualRefreshOnly = false;
+	if (TasInput::IsFrameAdvancePaused())
+	{
+		snd_core::AXOut_updateDevicePlayState(false);
+		TasInput::WaitForFrameAdvancePermit();
+		visualRefreshOnly = TasInput::ConsumeFrameAdvanceVisualRefreshPermit();
+	}
+	if (g_lattePauseRequested.load(std::memory_order_acquire) && !visualRefreshOnly)
+		return;
+	snd_core::AXOut_updateDevicePlayState(!visualRefreshOnly);
+	if (!visualRefreshOnly)
+	{
+		const uint64 presentedFrame = LatteGPUState.frameCounter;
+		performanceMonitor.cycle[performanceMonitor.cycleIndex].frameCounter++;
+		if (LatteGPUState.frameCounter > 5)
+			performanceMonitor.gpuTime_frameTime.endMeasuring();
+		LattePerformanceMonitor_frameEnd();
+		LatteGPUState.frameCounter++;
+		TasInput::OnFramePresented(presentedFrame);
+	}
 	g_renderer->SwapBuffers(true, true);
 
 	catchOpenGLError();
-	performanceMonitor.gpuTime_frameTime.beginMeasuring();
+	if (!visualRefreshOnly)
+		performanceMonitor.gpuTime_frameTime.beginMeasuring();
 
-	LatteTC_CleanupUnusedTextures();
-	LatteDraw_cleanupAfterFrame();
-	LatteQuery_CancelActiveGPU7Queries();
-	LatteBufferCache_notifySwapTVScanBuffer();
-	LattePerformanceMonitor_frameBegin();
+	if (!visualRefreshOnly)
+	{
+		LatteTC_CleanupUnusedTextures();
+		LatteDraw_cleanupAfterFrame();
+		LatteQuery_CancelActiveGPU7Queries();
+		LatteBufferCache_notifySwapTVScanBuffer();
+		LattePerformanceMonitor_frameBegin();
+	}
 }
 
 void LatteRenderTarget_applyTextureColorClear(LatteTexture* texture, uint32 sliceIndex, uint32 mipIndex, float r, float g, float b, float a, uint64 eventCounter)
@@ -1093,3 +1114,4 @@ void LatteRenderTarget_unloadAll()
 		g_emptyFBO = nullptr;
 	}
 }
+
