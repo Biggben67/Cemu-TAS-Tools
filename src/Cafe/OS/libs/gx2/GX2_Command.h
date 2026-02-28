@@ -101,8 +101,10 @@ namespace GX2
 
 	bool GX2GetDisplayListWriteStatus();
 
-    void GX2CommandInit();
+	void GX2CommandInit();
 	void GX2Init_commandBufferPool(void* bufferBase, uint32 bufferSize);
 	void GX2Shutdown_commandBufferPool();
-    void GX2CommandResetToDefaultState();
+	void GX2CommandResetToDefaultState();
+	void GX2CommandResyncAfterTimelineLoad();
 }
+
