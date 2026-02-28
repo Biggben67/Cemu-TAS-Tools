@@ -57,22 +57,34 @@ namespace acp
 
 	ACPStatus ACPMountSaveDir()
 	{
-        cemu_assert_debug(!sSaveDirMounted);
+		if (sSaveDirMounted)
+		{
+			cemuLog_log(LogType::Force, "nn_acp.ACPMountSaveDir already mounted");
+			return ACPStatus::SUCCESS;
+		}
 		uint64 titleId = CafeSystem::GetForegroundTitleId();
 		uint32 high = GetTitleIdHigh(titleId) & (~0xC);
 		uint32 low = GetTitleIdLow(titleId);
 
 		// mount save path
 		const auto mlc = ActiveSettings::GetMlcPath("usr/save/{:08x}/{:08x}/user/", high, low);
+		cemuLog_log(LogType::Force, "nn_acp.ACPMountSaveDir mount /vol/save -> {}", _pathToUtf8(mlc));
 		FSCDeviceHostFS_Mount("/vol/save/", _pathToUtf8(mlc), FSC_PRIORITY_BASE);
+		sSaveDirMounted = true;
 		nnResult mountResult = BUILD_NN_RESULT(NN_RESULT_LEVEL_SUCCESS, NN_RESULT_MODULE_NN_ACP, 0);
 		return _ACPConvertResultToACPStatus(&mountResult);
 	}
 
     ACPStatus ACPUnmountSaveDir()
     {
-        cemu_assert_debug(!sSaveDirMounted);
+		if (!sSaveDirMounted)
+		{
+			cemuLog_log(LogType::Force, "nn_acp.ACPUnmountSaveDir already unmounted");
+			return ACPStatus::SUCCESS;
+		}
+		cemuLog_log(LogType::Force, "nn_acp.ACPUnmountSaveDir unmount /vol/save");
         fsc_unmount("/vol/save/", FSC_PRIORITY_BASE);
+		sSaveDirMounted = false;
         return ACPStatus::SUCCESS;
     }
 
@@ -381,3 +393,4 @@ namespace acp
 	}
 }
 }
+
