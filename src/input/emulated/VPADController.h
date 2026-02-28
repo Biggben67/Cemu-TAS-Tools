@@ -55,6 +55,7 @@ public:
 	Type type() const override { return VPAD; }
 
 	void VPADRead(VPADStatus_t& status, const BtnRepeat& repeat);
+	void InvalidateCachedReadState();
 
 	void update() override;
 
@@ -96,8 +97,12 @@ private:
 	bool m_screen_active = false;
 	bool m_screen_active_toggle = false;
 	uint32be m_last_holdvalue = 0;
+	bool m_hasCachedStatus = false;
+	uint32 m_cachedFrameCounter = 0;
+	VPADStatus_t m_cachedStatus{};
 
-	std::chrono::high_resolution_clock::time_point m_last_hold_change{}, m_last_pulse{};
+	uint64 m_last_hold_change_frame = 0;
+	uint64 m_last_pulse_frame = 0;
 
 	std::mutex m_rumble_mutex;
 	std::chrono::high_resolution_clock::time_point m_last_rumble_check{};
@@ -108,3 +113,4 @@ private:
 	void update_motion(VPADStatus_t& status);
 	glm::ivec2 m_last_touch_position{};
 };
+
