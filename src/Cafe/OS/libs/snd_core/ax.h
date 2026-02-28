@@ -55,6 +55,30 @@ namespace snd_core
 	const int AX_AUX_BUS_COUNT = 3;
 	const int AX_MAX_NUM_BUS = 4;
 
+	struct TimelineRuntimeSnapshot
+	{
+		bool valid{};
+		bool isInitialized{};
+		bool isSoundCore2{};
+		uint32 rendererFreq{};
+		uint32 frameLength{};
+		uint32 pipelineMode{};
+		std::array<sint32, AX_DEV_COUNT> deviceUpsampleStage{};
+		MPTR frameCallback{MPTR_NULL};
+		std::array<MPTR, AX_APP_FRAME_CALLBACK_MAX> appFrameCallbacks{};
+		std::array<MPTR, AX_DEV_COUNT> deviceFinalMixCallbacks{};
+		std::array<sint32, AX_DEV_COUNT> deviceMode{};
+		std::array<uint16, AX_AUX_BUS_COUNT> tvAuxReturnVolume{};
+		std::array<MPTR, AX_AUX_BUS_COUNT> auxTvCallbackFunc{};
+		std::array<MPTR, AX_AUX_BUS_COUNT> auxTvCallbackUserParam{};
+		std::array<MPTR, AX_AUX_BUS_COUNT * 2> auxDrcCallbackFunc{};
+		std::array<MPTR, AX_AUX_BUS_COUNT * 2> auxDrcCallbackUserParam{};
+		std::array<MPTR, AX_AUX_BUS_COUNT> oldAuxTvCallbackFunc{};
+		std::array<MPTR, AX_AUX_BUS_COUNT> oldAuxTvCallbackUserParam{};
+		std::array<MPTR, AX_AUX_BUS_COUNT * 2> oldAuxDrcCallbackFunc{};
+		std::array<MPTR, AX_AUX_BUS_COUNT * 2> oldAuxDrcCallbackUserParam{};
+	};
+
 	const int AX_FORMAT_ADPCM = 0x0;
 	const int AX_FORMAT_PCM16 = 0xA;
 	const int AX_FORMAT_PCM8 = 0x19;
@@ -79,6 +103,8 @@ namespace snd_core
 
 	bool isInitialized();
 	void reset();
+	void CaptureTimelineRuntime(TimelineRuntimeSnapshot& outSnapshot);
+	void RestoreTimelineRuntime(const TimelineRuntimeSnapshot& snapshot);
 
 	// AX VPB
 
@@ -258,7 +284,7 @@ namespace snd_core
 
 	void AXIst_Init();
 	void AXIst_ThreadEntry(PPCInterpreter_t* hCPU);
-	void AXIst_QueueFrame();
+	bool AXIst_QueueFrame();
 
 	void AXResetCallbacks();
 
@@ -390,7 +416,10 @@ namespace snd_core
 	void AXOut_init();
 	void AXOut_reset();
 	void AXOut_update();
+	void AXOut_resyncFrameQueue();
+	void AXOut_updateDevicePlayState(bool isPlaying);
 
 	COSModule* GetModuleSndCore1();
 	COSModule* GetModuleSndCore2();
 }
+
