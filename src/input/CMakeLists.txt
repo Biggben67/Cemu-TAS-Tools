@@ -39,6 +39,8 @@ add_library(CemuInput
 	emulated/VPADController.h
 	emulated/ClassicController.cpp
 	emulated/ClassicController.h
+	TAS/TASInput.cpp
+	TAS/TASInput.h
 )
 
 set_property(TARGET CemuInput PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -99,3 +101,4 @@ endif()
 if (ENABLE_BLUEZ)
 	target_link_libraries(CemuInput PRIVATE bluez::bluez)
 endif ()
+
