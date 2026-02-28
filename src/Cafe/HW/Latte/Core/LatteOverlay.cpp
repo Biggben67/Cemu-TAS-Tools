@@ -1,5 +1,6 @@
 #include "Cafe/HW/Latte/Core/LatteOverlay.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
+#include "Cafe/HW/Latte/Core/Latte.h"
 #include "WindowSystem.h"
 
 #include "config/CemuConfig.h"
@@ -12,6 +13,7 @@
 #include "imgui/imgui_extension.h"
 
 #include "input/InputManager.h"
+#include "input/TAS/TASInput.h"
 #include "util/SystemInfo/SystemInfo.h"
 
 #include <cinttypes>
@@ -67,6 +69,73 @@ struct OverlayList
 const auto kPopupFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
 
 const float kBackgroundAlpha = 0.65f;
+namespace
+{
+	int StickFloatToByte(float value)
+	{
+		const int raw = (int)std::lround((std::clamp(value, -1.0f, 1.0f) + 1.0f) * 0.5f * 255.0f);
+		return std::clamp(raw, 0, 255);
+	}
+
+	std::string BuildButtonLabel(uint32 mask)
+	{
+		std::string out;
+		auto append = [&out](bool enabled, const char* name)
+		{
+			if (!enabled)
+				return;
+			if (!out.empty())
+				out += " ";
+			out += name;
+		};
+
+		append((mask & TasInput::kBtnA) != 0, "A");
+		append((mask & TasInput::kBtnB) != 0, "B");
+		append((mask & TasInput::kBtnX) != 0, "X");
+		append((mask & TasInput::kBtnY) != 0, "Y");
+		append((mask & TasInput::kBtnL) != 0, "L");
+		append((mask & TasInput::kBtnR) != 0, "R");
+		append((mask & TasInput::kBtnZL) != 0, "ZL");
+		append((mask & TasInput::kBtnZR) != 0, "ZR");
+		append((mask & TasInput::kBtnPlus) != 0, "Plus");
+		append((mask & TasInput::kBtnMinus) != 0, "Minus");
+		append((mask & TasInput::kBtnUp) != 0, "Up");
+		append((mask & TasInput::kBtnDown) != 0, "Down");
+		append((mask & TasInput::kBtnLeft) != 0, "Left");
+		append((mask & TasInput::kBtnRight) != 0, "Right");
+		append((mask & TasInput::kBtnStickL) != 0, "StickL");
+		append((mask & TasInput::kBtnStickR) != 0, "StickR");
+		append((mask & TasInput::kBtnHome) != 0, "Home");
+
+		if (out.empty())
+			out = "-";
+		return out;
+	}
+
+	void LatteOverlay_renderTasOverlay(ImVec2& position, ImVec2& pivot, sint32 direction)
+	{
+		const auto tasState = TasInput::GetOverlayState(LatteGPUState.frameCounter, 0);
+		if (!tasState.active)
+			return;
+
+		ImGui::SetNextWindowPos(position, ImGuiCond_Always, pivot);
+		ImGui::SetNextWindowBgAlpha(kBackgroundAlpha);
+		if (ImGui::Begin("TAS overlay", nullptr, kPopupFlags))
+		{
+			ImGui::Text("Frame: %" PRIu64, tasState.frame);
+			ImGui::Text("Mode: %s", tasState.manual ? "Manual" : (tasState.playback ? "Playback" : "FrameAdvance"));
+			ImGui::Text("Buttons: %s", BuildButtonLabel(tasState.buttons).c_str());
+			ImGui::Text("L(%3d,%3d) R(%3d,%3d) ZL %.2f ZR %.2f",
+				StickFloatToByte(tasState.lx), StickFloatToByte(tasState.ly),
+				StickFloatToByte(tasState.rx), StickFloatToByte(tasState.ry),
+				tasState.zl, tasState.zr);
+
+			position.y += (ImGui::GetWindowSize().y + 10.0f) * direction;
+		}
+		ImGui::End();
+	}
+}
+
 void LatteOverlay_renderOverlay(ImVec2& position, ImVec2& pivot, sint32 direction, float fontSize, bool pad)
 {
 	auto& config = GetConfig();
@@ -119,6 +188,7 @@ void LatteOverlay_renderOverlay(ImVec2& position, ImVec2& pivot, sint32 directio
 		}
 		ImGui::End();
 	}
+	LatteOverlay_renderTasOverlay(position, pivot, direction);
 
 	ImGui::PopStyleColor();
 	ImGui::PopFont();
@@ -515,7 +585,8 @@ void LatteOverlay_translateScreenPosition(ScreenPosition pos, const Vector2f& wi
 void LatteOverlay_render(bool pad_view)
 {
 	const auto& config = GetConfig();
-	if(config.overlay.position == ScreenPosition::kDisabled && config.notification.position == ScreenPosition::kDisabled)
+	const bool hasTasOverlay = TasInput::HasOverlayData();
+	if(config.overlay.position == ScreenPosition::kDisabled && config.notification.position == ScreenPosition::kDisabled && !hasTasOverlay)
 		return;
 
 	sint32 w = 0, h = 0;
@@ -548,6 +619,11 @@ void LatteOverlay_render(bool pad_view)
 	if (config.overlay.position != ScreenPosition::kDisabled)
 	{
 		LatteOverlay_translateScreenPosition(config.overlay.position, window_size, position, pivot, direction);
+		LatteOverlay_renderOverlay(position, pivot, direction, overlayFontSize, pad_view);
+	}
+	else if (hasTasOverlay)
+	{
+		LatteOverlay_translateScreenPosition(ScreenPosition::kTopLeft, window_size, position, pivot, direction);
 		LatteOverlay_renderOverlay(position, pivot, direction, overlayFontSize, pad_view);
 	}
 	
@@ -612,3 +688,4 @@ void LatteOverlay_updateStats(double fps, sint32 drawcalls, sint32 fastDrawcalls
 	// update vram
 	g_renderer->GetVRAMInfo(g_state.vramUsage, g_state.vramTotal);
 }
+
