@@ -8,6 +8,7 @@
 #include "Cafe/HW/Espresso/Debugger/GDBStub.h"
 #include "Cafe/HW/Espresso/Interpreter/PPCInterpreterInternal.h"
 #include "Cafe/HW/Espresso/Recompiler/PPCRecompiler.h"
+#include "input/TAS/TASInput.h"
 
 #include "util/helpers/Semaphore.h"
 #include "util/helpers/ConcurrentQueue.h"
@@ -77,10 +78,12 @@ namespace coreinit
 
 	thread_local uint32 t_assignedCoreIndex;
 	thread_local Fiber* t_schedulerFiber;
+	extern OSThread_t* __currentCoreThread[3];
 
 	struct OSHostThread
 	{
-		OSHostThread(OSThread_t* thread) : m_thread(thread), m_fiber((void(*)(void*))__OSFiberThreadEntry, this, this)
+		OSHostThread(OSThread_t* thread)
+			: m_thread(thread), m_fiber((void(*)(void*))__OSFiberThreadEntry, this, this), ppcInstance{}, selectedCore(0)
 		{
 		}
 
@@ -95,6 +98,27 @@ namespace coreinit
 	};
 
 	std::unordered_map<OSThread_t*, OSHostThread*> s_threadToFiber;
+
+	static OSThread_t* __OSResolveCurrentThreadFromActiveFiber()
+	{
+		OSThread_t* currentThread = OSGetCurrentThread();
+		if (currentThread && currentThread->IsValidMagic())
+			return currentThread;
+
+		OSHostThread* hostThread = (OSHostThread*)Fiber::GetFiberPrivateData();
+		if (hostThread && hostThread->m_thread && hostThread->m_thread->IsValidMagic())
+		{
+			PPCInterpreter_t* hCPU = PPCInterpreter_getCurrentInstance();
+			const uint32 coreIndex = hCPU ? hCPU->spr.UPIR : std::min<uint32>(hostThread->selectedCore, Espresso::CORE_COUNT - 1);
+			OSSetCurrentThread(coreIndex, hostThread->m_thread);
+			cemuLog_log(LogType::Force, "Timeline scheduler guard: rebound current thread from host fiber core={} thread=0x{:08x}",
+				coreIndex,
+				memory_getVirtualOffsetFromPointer(hostThread->m_thread));
+			return hostThread->m_thread;
+		}
+
+		return nullptr;
+	}
 
 	bool __CemuIsMulticoreMode()
 	{
@@ -230,7 +254,12 @@ namespace coreinit
 
 	void threadEntry(PPCInterpreter_t* hCPU)
 	{
-		OSThread_t* currentThread = coreinit::OSGetCurrentThread();
+		OSThread_t* currentThread = __OSResolveCurrentThreadFromActiveFiber();
+		if (!currentThread)
+		{
+			cemuLog_log(LogType::Force, "Timeline scheduler guard: threadEntry missing current thread; aborting entry");
+			return;
+		}
 		uint32 r3 = hCPU->gpr[3];
 		uint32 r4 = hCPU->gpr[4];
 		uint32 lr = hCPU->spr.LR;
@@ -576,7 +605,14 @@ namespace coreinit
 	{
 		PPCInterpreter_t* hCPU = PPCInterpreter_getCurrentInstance();
 		hCPU->gpr[3] = exitValue;
-		OSThread_t* currentThread = coreinit::OSGetCurrentThread();
+		OSThread_t* currentThread = __OSResolveCurrentThreadFromActiveFiber();
+		if (!currentThread)
+		{
+			cemuLog_log(LogType::Force, "Timeline scheduler guard: OSExitThread missing current thread; forcing scheduler handoff");
+			__OSLockScheduler();
+			PPCCore_switchToSchedulerWithLock();
+			return;
+		}
 
 		// thread cleanup callback
 		if (currentThread->cleanupCallback)
@@ -1181,6 +1217,20 @@ namespace coreinit
 
 	uint32 s_lehmer_lcg[PPC_CORE_COUNT] = { 0 };
 
+	void OSSchedulerCaptureDeterminismStateNoLock(std::array<uint32, Espresso::CORE_COUNT>& outCoreLehmerState)
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		for (size_t i = 0; i < Espresso::CORE_COUNT; ++i)
+			outCoreLehmerState[i] = s_lehmer_lcg[i];
+	}
+
+	void OSSchedulerRestoreDeterminismStateNoLock(const std::array<uint32, Espresso::CORE_COUNT>& coreLehmerState)
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		for (size_t i = 0; i < Espresso::CORE_COUNT; ++i)
+			s_lehmer_lcg[i] = coreLehmerState[i];
+	}
+
 	void __OSThreadStartTimeslice(OSThread_t* thread, PPCInterpreter_t* hCPU)
 	{
 		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
@@ -1189,10 +1239,13 @@ namespace coreinit
 		hCPU->skippedCycles = 0;
 		// we add a slight randomized variance to the thread quantum to avoid getting stuck in repeated code sequences where one or multiple threads always unload inside a lock
 		// this was seen in Mario Party 10 during early boot where several OSLockMutex operations would align in such a way that one thread would never successfully acquire the lock
-		if (s_lehmer_lcg[coreIndex] == 0)
-			s_lehmer_lcg[coreIndex] = 12345;
-		hCPU->remainingCycles += (s_lehmer_lcg[coreIndex] & 0x7F);
-		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
+		if (!TasInput::IsDeterministicSchedulerEnabled())
+		{
+			if (s_lehmer_lcg[coreIndex] == 0)
+				s_lehmer_lcg[coreIndex] = 12345;
+			hCPU->remainingCycles += (s_lehmer_lcg[coreIndex] & 0x7F);
+			s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
+		}
 	}
 
 	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
@@ -1255,7 +1308,13 @@ namespace coreinit
 		__OSUnlockScheduler();
 		while (true)
 		{
-			if (!g_coreRunQueueThreadCount[coreIndex].isZero()) // avoid hammering the lock on the main core if there is no runable thread
+			if (isMainCore)
+				TasInput::WaitForFrameAdvanceCpuPermit();
+
+			// For the main core, always probe once per loop. After Timeline load the
+			// run-queue counter can transiently desync even while runnable threads exist.
+			// Probing unconditionally prevents a permanent "no runnable thread" stall.
+			if (isMainCore || !g_coreRunQueueThreadCount[coreIndex].isZero())
 			{
 				__OSLockScheduler();
 				OSThread_t* nextThread = __OSGetNextRunableThread(coreIndex);
@@ -1292,8 +1351,21 @@ namespace coreinit
 		//if (ppcInterpreterCurrentInstance)
 		//	debug_printf("Core %d store thread %08x (t = %d)\n", hostThread->ppcInstance.sprNew.UPIR, memory_getVirtualOffsetFromPointer(hostThread->thread), t_assignedCoreIndex);
 
+		OSThread_t* currentThread = OSGetCurrentThread();
+		if (currentThread == nullptr || !currentThread->IsValidMagic())
+		{
+			// After Timeline load, queue rebuild/requeue paths can transiently clear the
+			// per-core current-thread slot before this running host fiber yields.
+			// Recover by using the host fiber's owning PPC thread to avoid null store.
+			currentThread = hostThread->m_thread;
+			OSSetCurrentThread(OSGetCoreId(), currentThread);
+			cemuLog_log(LogType::Force, "Timeline scheduler guard: recovered null current thread core={} hostThread=0x{:08x}",
+				OSGetCoreId(),
+				memory_getVirtualOffsetFromPointer(currentThread));
+		}
+
 		// store context of current thread
-		__OSStoreThread(OSGetCurrentThread(), &hostThread->ppcInstance);
+		__OSStoreThread(currentThread, &hostThread->ppcInstance);
 		cemu_assert_debug(PPCInterpreter_getCurrentInstance() == nullptr);
 
 		if (!sSchedulerActive.load(std::memory_order::relaxed))
@@ -1358,8 +1430,10 @@ namespace coreinit
 		{
 			if (hCPU->remainingCycles > 0)
 			{
-				// try to enter recompiler immediately
-				PPCRecompiler_attemptEnterWithoutRecompile(hCPU, hCPU->instructionPointer);
+				// For active TAS movies, stay on interpreter path only.
+				// This favors determinism over performance and mirrors conservative TAS setups.
+				if (!TasInput::IsMovieActive())
+					PPCRecompiler_attemptEnterWithoutRecompile(hCPU, hCPU->instructionPointer);
 				// keep executing as long as there are cycles left
 				while ((--hCPU->remainingCycles) >= 0)
 					PPCInterpreterSlim_executeInstruction(hCPU);
@@ -1428,6 +1502,523 @@ namespace coreinit
 	std::vector<std::thread::native_handle_type>& OSGetSchedulerThreads()
 	{
 		return g_schedulerThreadHandles;
+	}
+
+	void OSSchedulerCaptureHostThreadStatesNoLock(std::vector<OSSchedulerHostThreadState>& outStates)
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		outStates.clear();
+		outStates.reserve(s_threadToFiber.size());
+		for (const auto& it : s_threadToFiber)
+		{
+			OSSchedulerHostThreadState state{};
+			state.thread = memory_getVirtualOffsetFromPointer(it.first);
+			state.selectedCore = it.second->selectedCore;
+			state.ppcInstance.resize(sizeof(PPCInterpreter_t));
+			memcpy(state.ppcInstance.data(), &it.second->ppcInstance, sizeof(PPCInterpreter_t));
+			outStates.emplace_back(std::move(state));
+		}
+	}
+
+	bool OSSchedulerRebuildQueuesNoLock(const std::vector<MPTR>& threadList)
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+
+		std::vector<OSThread_t*> threads;
+		threads.reserve(threadList.size());
+		for (const auto threadMptr : threadList)
+		{
+			auto* thread = (OSThread_t*)memory_getPointerFromVirtualOffsetAllowNull(threadMptr);
+			if (!thread || !thread->IsValidMagic())
+				return false;
+			threads.emplace_back(thread);
+		}
+
+		OSInitThreadQueue(g_activeThreadQueue.GetPtr());
+		for (sint32 i = 0; i < Espresso::CORE_COUNT; ++i)
+		{
+			OSInitThreadQueue(g_coreRunQueue.GetPtr() + i);
+			g_coreRunQueueThreadCount[i].reset();
+			__currentCoreThread[i] = nullptr;
+		}
+
+		srwlock_activeThreadList.LockWrite();
+		activeThreadCount = 0;
+		for (auto* thread : threads)
+		{
+			if (activeThreadCount >= 256)
+			{
+				srwlock_activeThreadList.UnlockWrite();
+				return false;
+			}
+			activeThread[activeThreadCount++] = memory_getVirtualOffsetFromPointer(thread);
+			g_activeThreadQueue->addThread(thread, &thread->activeThreadChain);
+
+			for (sint32 core = 0; core < Espresso::CORE_COUNT; ++core)
+			{
+				thread->currentRunQueue[core] = nullptr;
+				thread->linkRun[core].next = nullptr;
+				thread->linkRun[core].prev = nullptr;
+			}
+
+			if (thread->state == OSThread_t::THREAD_STATE::STATE_RUNNING)
+				thread->state = OSThread_t::THREAD_STATE::STATE_READY;
+			if (thread->state == OSThread_t::THREAD_STATE::STATE_READY)
+			{
+				thread->currentWaitQueue = nullptr;
+				thread->waitQueueLink.next = nullptr;
+				thread->waitQueueLink.prev = nullptr;
+			}
+
+			__OSAddReadyThreadToRunQueue(thread);
+		}
+		srwlock_activeThreadList.UnlockWrite();
+		return true;
+	}
+
+	bool OSSchedulerRebuildHostThreadsNoLock(const std::vector<MPTR>& threadList)
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+
+		std::vector<OSThread_t*> threads;
+		threads.reserve(threadList.size());
+		for (const auto threadMptr : threadList)
+		{
+			auto* thread = (OSThread_t*)memory_getPointerFromVirtualOffsetAllowNull(threadMptr);
+			if (!thread)
+				return false;
+			threads.emplace_back(thread);
+		}
+
+		for (auto& it : s_threadToFiber)
+			delete it.second;
+		s_threadToFiber.clear();
+
+		for (auto* thread : threads)
+		{
+			__OSCreateHostThread(thread);
+			auto itr = s_threadToFiber.find(thread);
+			if (itr != s_threadToFiber.end())
+				itr->second->selectedCore = std::min<uint32>((uint32)thread->context.upir, Espresso::CORE_COUNT - 1);
+		}
+		return true;
+	}
+
+	bool OSSchedulerRestoreHostThreadStatesNoLock(const std::vector<OSSchedulerHostThreadState>& inStates)
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		bool hadErrors = false;
+		std::unordered_set<OSThread_t*> restoredThreads;
+		restoredThreads.reserve(inStates.size());
+		for (const auto& state : inStates)
+		{
+			auto thread = (OSThread_t*)memory_getPointerFromVirtualOffsetAllowNull(state.thread);
+			if (!thread)
+			{
+				hadErrors = true;
+				continue;
+			}
+			auto itr = s_threadToFiber.find(thread);
+			if (itr == s_threadToFiber.end())
+			{
+				hadErrors = true;
+				continue;
+			}
+			itr->second->selectedCore = std::min<uint32>(state.selectedCore, Espresso::CORE_COUNT - 1);
+			if (state.ppcInstance.size() == sizeof(PPCInterpreter_t))
+			{
+				memcpy(&itr->second->ppcInstance, state.ppcInstance.data(), sizeof(PPCInterpreter_t));
+			}
+			else if (!state.ppcInstance.empty())
+			{
+				hadErrors = true;
+			}
+			restoredThreads.emplace(thread);
+		}
+
+		for (auto& it : s_threadToFiber)
+		{
+			if (restoredThreads.find(it.first) != restoredThreads.end())
+				continue;
+			it.second->selectedCore = std::min<uint32>((uint32)it.first->context.upir, Espresso::CORE_COUNT - 1);
+		}
+		return !hadErrors;
+	}
+
+	void OSSchedulerCaptureCurrentCoreThreadsNoLock(std::array<MPTR, Espresso::CORE_COUNT>& outCurrentCoreThreads)
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		for (size_t i = 0; i < Espresso::CORE_COUNT; ++i)
+		{
+			outCurrentCoreThreads[i] = __currentCoreThread[i] ? memory_getVirtualOffsetFromPointer(__currentCoreThread[i]) : MPTR_NULL;
+		}
+	}
+
+	void OSSchedulerRestoreCurrentCoreThreadsNoLock(const std::array<MPTR, Espresso::CORE_COUNT>& currentCoreThreads)
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		for (size_t i = 0; i < Espresso::CORE_COUNT; ++i)
+		{
+			__currentCoreThread[i] = (OSThread_t*)memory_getPointerFromVirtualOffsetAllowNull(currentCoreThreads[i]);
+		}
+	}
+
+	bool OSSchedulerEnsureLivenessAfterStateLoadNoLock(bool allowAggressiveEscalation)
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+
+		auto isLikelySystemThread = [](OSThread_t* thread) -> bool
+		{
+			if (!thread)
+				return true;
+			// Avoid reading thread-name pointers during liveness recovery.
+			// A stale/restored name pointer can crash strcmp on rare loads.
+			return thread->effectivePriority <= 32;
+		};
+
+		auto collectThreadState = [](
+			size_t& runnableCountOut,
+			size_t& runningCountOut,
+			size_t& waitingCountOut,
+			size_t& waitingSuspendedCountOut,
+			size_t& userRunnableCountOut,
+			OSThread_t*& mainThreadWaitOut,
+			OSThread_t*& preferredUserWakeOut,
+			OSThread_t*& preferredWakeOut,
+			OSThread_t*& fallbackWakeOut,
+			const auto& isLikelySystemThreadRef)
+		{
+			runnableCountOut = 0;
+			runningCountOut = 0;
+			waitingCountOut = 0;
+			waitingSuspendedCountOut = 0;
+			userRunnableCountOut = 0;
+			mainThreadWaitOut = nullptr;
+			preferredUserWakeOut = nullptr;
+			preferredWakeOut = nullptr;
+			fallbackWakeOut = nullptr;
+
+			srwlock_activeThreadList.LockRead();
+			for (sint32 i = 0; i < activeThreadCount; ++i)
+			{
+				auto* thread = (OSThread_t*)memory_getPointerFromVirtualOffsetAllowNull(activeThread[i]);
+				if (!thread)
+					continue;
+				if (thread->state == OSThread_t::THREAD_STATE::STATE_READY && thread->suspendCounter == 0)
+				{
+					++runnableCountOut;
+					if (!isLikelySystemThreadRef(thread))
+						++userRunnableCountOut;
+				}
+				else if (thread->state == OSThread_t::THREAD_STATE::STATE_RUNNING && thread->suspendCounter == 0)
+				{
+					++runnableCountOut;
+					++runningCountOut;
+					if (!isLikelySystemThreadRef(thread))
+						++userRunnableCountOut;
+				}
+				else if (thread->state == OSThread_t::THREAD_STATE::STATE_WAITING)
+				{
+					++waitingCountOut;
+					if (thread->suspendCounter != 0)
+						++waitingSuspendedCountOut;
+					const bool isSystemThread = isLikelySystemThreadRef(thread);
+					if (!mainThreadWaitOut && !isSystemThread)
+						mainThreadWaitOut = thread;
+					// Prefer unsuspended non-system waiting threads first so gameplay can progress.
+					if (!preferredUserWakeOut && !isSystemThread && thread->suspendCounter == 0)
+						preferredUserWakeOut = thread;
+					// Prefer unsuspended waiting threads first.
+					if (!preferredWakeOut && thread->suspendCounter == 0)
+						preferredWakeOut = thread;
+					if (!fallbackWakeOut)
+						fallbackWakeOut = thread;
+				}
+			}
+			srwlock_activeThreadList.UnlockRead();
+			if (preferredUserWakeOut)
+				preferredWakeOut = preferredUserWakeOut;
+			if (!preferredWakeOut && mainThreadWaitOut)
+				preferredWakeOut = mainThreadWaitOut;
+		};
+
+		size_t runnableCount = 0;
+		size_t runningCount = 0;
+		size_t waitingCount = 0;
+		size_t waitingSuspendedCount = 0;
+		size_t userRunnableCount = 0;
+		OSThread_t* mainThreadWait = nullptr;
+		OSThread_t* preferredUserWake = nullptr;
+		OSThread_t* preferredWake = nullptr;
+		OSThread_t* fallbackWake = nullptr;
+		collectThreadState(runnableCount, runningCount, waitingCount, waitingSuspendedCount, userRunnableCount, mainThreadWait, preferredUserWake, preferredWake, fallbackWake, isLikelySystemThread);
+
+		const bool likelyStalledMainThread =
+			(mainThreadWait != nullptr) &&
+			(runningCount == 0);
+		if (runnableCount != 0 && !likelyStalledMainThread)
+			return false;
+
+		OSThread_t* wakeThread = preferredUserWake ? preferredUserWake : (preferredWake ? preferredWake : fallbackWake);
+		if (!wakeThread)
+		{
+			cemuLog_log(LogType::Force, "Timeline scheduler liveness: no runnable and no wake candidate (waiting={} waitingSuspended={})",
+				waitingCount, waitingSuspendedCount);
+			return false;
+		}
+
+		const sint32 prevSuspend = wakeThread->suspendCounter;
+		wakeThread->suspendCounter = 0;
+		if (wakeThread->currentWaitQueue != nullptr)
+		{
+			// Two-stage recovery:
+			// 1) conservative single wake
+			// 2) escalate to full wait-queue wake only if no runnable thread appears
+			OSThreadQueueInternal* wakeQueue = wakeThread->currentWaitQueue.GetPtr();
+			wakeQueue->wakeupSingleThreadWaitQueue(true);
+
+			size_t runnableCountAfterSingle = 0;
+			size_t runningCountAfterSingle = 0;
+			size_t waitingCountAfterSingle = 0;
+			size_t waitingSuspendedAfterSingle = 0;
+			size_t userRunnableAfterSingle = 0;
+			OSThread_t* mainThreadAfterSingle = nullptr;
+			OSThread_t* preferredUserAfterSingle = nullptr;
+			OSThread_t* preferredAfterSingle = nullptr;
+			OSThread_t* fallbackAfterSingle = nullptr;
+			collectThreadState(runnableCountAfterSingle, runningCountAfterSingle, waitingCountAfterSingle, waitingSuspendedAfterSingle, userRunnableAfterSingle, mainThreadAfterSingle, preferredUserAfterSingle, preferredAfterSingle, fallbackAfterSingle, isLikelySystemThread);
+			const bool stillLikelyStalledMainThreadAfterSingle =
+				(mainThreadAfterSingle != nullptr) &&
+				(runningCountAfterSingle == 0);
+			if (allowAggressiveEscalation && (runnableCountAfterSingle == 0 || stillLikelyStalledMainThreadAfterSingle))
+			{
+				wakeQueue->wakeupEntireWaitQueue(true);
+				cemuLog_log(LogType::Force, "Timeline scheduler liveness: escalated to full wait-queue wake waitingAfterSingle={} waitingSuspendedAfterSingle={} dueToStalledMainThread={}",
+					waitingCountAfterSingle,
+					waitingSuspendedAfterSingle,
+					stillLikelyStalledMainThreadAfterSingle ? "true" : "false");
+			}
+		}
+		else
+		{
+			wakeThread->state = OSThread_t::THREAD_STATE::STATE_READY;
+			__OSAddReadyThreadToRunQueue(wakeThread);
+		}
+
+		size_t runnableCountAfterWake = 0;
+		size_t runningCountAfterWake = 0;
+		size_t waitingCountAfterWake = 0;
+		size_t waitingSuspendedAfterWake = 0;
+		size_t userRunnableAfterWake = 0;
+		OSThread_t* mainThreadAfterWake = nullptr;
+		OSThread_t* preferredUserAfterWake = nullptr;
+		OSThread_t* preferredAfterWake = nullptr;
+		OSThread_t* fallbackAfterWake = nullptr;
+		collectThreadState(runnableCountAfterWake, runningCountAfterWake, waitingCountAfterWake, waitingSuspendedAfterWake, userRunnableAfterWake, mainThreadAfterWake, preferredUserAfterWake, preferredAfterWake, fallbackAfterWake, isLikelySystemThread);
+		const bool stillStalledMainThreadAfterWake =
+			(mainThreadAfterWake != nullptr) &&
+			(runningCountAfterWake == 0) &&
+			(userRunnableAfterWake == 0);
+		if (allowAggressiveEscalation && (runnableCountAfterWake == 0 || stillStalledMainThreadAfterWake) && mainThreadWait != nullptr)
+		{
+			// Hard fallback: if normal queue wakeups still leave the scheduler with no runnable
+			// threads (or only non-user runnable threads), force the title's main
+			// thread runnable.
+			if (mainThreadWait->currentWaitQueue != nullptr)
+			{
+				mainThreadWait->currentWaitQueue.GetPtr()->removeThread(mainThreadWait, &mainThreadWait->waitQueueLink);
+				mainThreadWait->currentWaitQueue = nullptr;
+			}
+			mainThreadWait->waitQueueLink.prev = nullptr;
+			mainThreadWait->waitQueueLink.next = nullptr;
+			mainThreadWait->suspendCounter = 0;
+			mainThreadWait->state = OSThread_t::THREAD_STATE::STATE_READY;
+			__OSAddReadyThreadToRunQueue(mainThreadWait);
+			cemuLog_log(LogType::Force, "Timeline scheduler liveness: forced mainThread runnable fallback thread=0x{:08x} runnableAfterWake={} runningAfterWake={} userRunnableAfterWake={} stalledAfterWake={}",
+				memory_getVirtualOffsetFromPointer(mainThreadWait),
+				runnableCountAfterWake, runningCountAfterWake, userRunnableAfterWake,
+				stillStalledMainThreadAfterWake ? "true" : "false");
+		}
+
+		cemuLog_log(LogType::Force, "Timeline scheduler liveness: woke thread=0x{:08x} waiting={} waitingSuspended={} runnableBefore={} runningBefore={} userRunnableBefore={} prevSuspend={} forcedForStalledMainThread={}",
+			memory_getVirtualOffsetFromPointer(wakeThread),
+			waitingCount, waitingSuspendedCount, runnableCount, runningCount, userRunnableCount, prevSuspend,
+			likelyStalledMainThread ? "true" : "false");
+		return true;
+	}
+
+	bool OSSchedulerForceMainThreadRunnableNoLock()
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+
+		bool changed = false;
+		OSThread_t* bestCandidate = nullptr;
+		srwlock_activeThreadList.LockRead();
+		for (sint32 i = 0; i < activeThreadCount; ++i)
+		{
+			auto* thread = (OSThread_t*)memory_getPointerFromVirtualOffsetAllowNull(activeThread[i]);
+			if (!thread)
+				continue;
+			if (thread->effectivePriority <= 32)
+				continue;
+			if (!bestCandidate || thread->effectivePriority < bestCandidate->effectivePriority)
+				bestCandidate = thread;
+		}
+		if (bestCandidate)
+		{
+			if (bestCandidate->suspendCounter != 0)
+			{
+				bestCandidate->suspendCounter = 0;
+				changed = true;
+			}
+			if (bestCandidate->state == OSThread_t::THREAD_STATE::STATE_WAITING)
+			{
+				if (bestCandidate->currentWaitQueue != nullptr)
+				{
+					bestCandidate->currentWaitQueue.GetPtr()->removeThread(bestCandidate, &bestCandidate->waitQueueLink);
+					bestCandidate->currentWaitQueue = nullptr;
+				}
+				bestCandidate->waitQueueLink.prev = nullptr;
+				bestCandidate->waitQueueLink.next = nullptr;
+				bestCandidate->state = OSThread_t::THREAD_STATE::STATE_READY;
+				changed = true;
+			}
+			if (bestCandidate->state == OSThread_t::THREAD_STATE::STATE_READY)
+			{
+				__OSAddReadyThreadToRunQueue(bestCandidate);
+				changed = true;
+			}
+		}
+		srwlock_activeThreadList.UnlockRead();
+
+		if (changed)
+			cemuLog_log(LogType::Force, "Timeline scheduler liveness: forced mainThread runnable safeguard applied");
+		return changed;
+	}
+
+	bool OSSchedulerForceDefaultThreadsUnsuspendedNoLock()
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		bool changed = false;
+		for (sint32 core = 0; core < Espresso::CORE_COUNT; ++core)
+		{
+			auto* thread = OSGetDefaultThread(core);
+			if (!thread)
+				continue;
+			if (thread->suspendCounter != 0)
+			{
+				thread->suspendCounter = 0;
+				changed = true;
+			}
+			if (thread->state == OSThread_t::THREAD_STATE::STATE_WAITING)
+			{
+				if (thread->currentWaitQueue != nullptr)
+				{
+					thread->currentWaitQueue.GetPtr()->removeThread(thread, &thread->waitQueueLink);
+					thread->currentWaitQueue = nullptr;
+				}
+				thread->waitQueueLink.prev = nullptr;
+				thread->waitQueueLink.next = nullptr;
+				thread->state = OSThread_t::THREAD_STATE::STATE_READY;
+				changed = true;
+			}
+			if (thread->state == OSThread_t::THREAD_STATE::STATE_READY)
+			{
+				__OSAddReadyThreadToRunQueue(thread);
+				changed = true;
+			}
+		}
+		if (changed)
+			cemuLog_log(LogType::Force, "Timeline scheduler liveness: default-thread unsuspend safeguard applied");
+		return changed;
+	}
+
+	bool OSSchedulerWakeAllWaitingThreadsNoLock()
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+
+		std::vector<OSThreadQueueInternal*> waitQueues;
+		waitQueues.reserve(32);
+		size_t waitingThreadCount = 0;
+
+		srwlock_activeThreadList.LockRead();
+		for (sint32 i = 0; i < activeThreadCount; ++i)
+		{
+			auto* thread = (OSThread_t*)memory_getPointerFromVirtualOffsetAllowNull(activeThread[i]);
+			if (!thread)
+				continue;
+			if (thread->suspendCounter != 0)
+				thread->suspendCounter = 0;
+			if (thread->state != OSThread_t::THREAD_STATE::STATE_WAITING)
+				continue;
+
+			++waitingThreadCount;
+			auto* q = thread->currentWaitQueue.GetPtr();
+			if (!q)
+				continue;
+			if (std::find(waitQueues.begin(), waitQueues.end(), q) == waitQueues.end())
+				waitQueues.emplace_back(q);
+		}
+		srwlock_activeThreadList.UnlockRead();
+
+		for (auto* q : waitQueues)
+			q->wakeupEntireWaitQueue(true);
+
+		if (!waitQueues.empty())
+		{
+			cemuLog_log(LogType::Force, "Timeline scheduler liveness: global wait-queue wake applied waitingThreads={} uniqueQueues={}",
+				waitingThreadCount, waitQueues.size());
+			return true;
+		}
+		return false;
+	}
+
+	bool OSSchedulerRequeueReadyThreadsNoLock()
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		for (sint32 i = 0; i < Espresso::CORE_COUNT; ++i)
+		{
+			OSInitThreadQueue(g_coreRunQueue.GetPtr() + i);
+			g_coreRunQueueThreadCount[i].reset();
+			__currentCoreThread[i] = nullptr;
+		}
+
+		size_t requeuedReadyCount = 0;
+		srwlock_activeThreadList.LockRead();
+		for (sint32 i = 0; i < activeThreadCount; ++i)
+		{
+			auto* thread = (OSThread_t*)memory_getPointerFromVirtualOffsetAllowNull(activeThread[i]);
+			if (!thread)
+				continue;
+
+			for (sint32 core = 0; core < Espresso::CORE_COUNT; ++core)
+			{
+				thread->currentRunQueue[core] = nullptr;
+				thread->linkRun[core].next = nullptr;
+				thread->linkRun[core].prev = nullptr;
+			}
+
+			if (thread->state == OSThread_t::THREAD_STATE::STATE_RUNNING)
+				thread->state = OSThread_t::THREAD_STATE::STATE_READY;
+
+			if (thread->state == OSThread_t::THREAD_STATE::STATE_READY && thread->suspendCounter == 0)
+			{
+				__OSAddReadyThreadToRunQueue(thread);
+				++requeuedReadyCount;
+			}
+		}
+		srwlock_activeThreadList.UnlockRead();
+
+		cemuLog_log(LogType::Force, "Timeline scheduler liveness: requeued ready threads count={}", requeuedReadyCount);
+		return requeuedReadyCount != 0;
+	}
+
+	void OSSchedulerKickCoresAfterStateLoadNoLock()
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		for (size_t i = 0; i < Espresso::CORE_COUNT; ++i)
+			g_coreRunQueueThreadCount[i].increment();
+		cemuLog_log(LogType::Force, "Timeline scheduler liveness: kicked core semaphores");
 	}
 
 	// starts PPC core emulation
@@ -1645,3 +2236,4 @@ namespace coreinit
 		__OSInitTerminatorThreads();
 	}
 }
+
