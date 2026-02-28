@@ -1,6 +1,8 @@
 #include "input/emulated/EmulatedController.h"
 
 #include "input/api/Controller.h"
+#include "input/TAS/TASInput.h"
+#include "Cafe/HW/Latte/Core/Latte.h"
 
 #ifdef SUPPORTS_WIIMOTE
 #include "input/api/Wiimote/NativeWiimoteController.h"
@@ -263,6 +265,13 @@ void EmulatedController::clear_controllers()
 
 float EmulatedController::get_axis_value(uint64 mapping) const
 {
+	if (type() == Type::VPAD)
+	{
+		float value = 0.0f;
+		if (TasInput::QueryVPADMappingValue(m_player_index, LatteGPUState.frameCounter, mapping, value))
+			return std::clamp(value, 0.0f, 1.0f);
+	}
+
 	const auto it = m_mappings.find(mapping);
 	if (it != m_mappings.cend())
 	{
@@ -276,6 +285,13 @@ float EmulatedController::get_axis_value(uint64 mapping) const
 
 bool EmulatedController::is_mapping_down(uint64 mapping) const
 {
+	if (type() == Type::VPAD)
+	{
+		float value = 0.0f;
+		if (TasInput::QueryVPADMappingValue(m_player_index, LatteGPUState.frameCounter, mapping, value))
+			return value > ControllerState::kAxisThreshold;
+	}
+
 	const auto it = m_mappings.find(mapping);
 	if (it != m_mappings.cend())
 	{
@@ -337,3 +353,4 @@ bool EmulatedController::operator!=(const EmulatedController& o) const
 {
 	return !(*this == o);
 }
+
