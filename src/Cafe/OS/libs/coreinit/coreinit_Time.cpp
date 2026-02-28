@@ -1,10 +1,19 @@
 #include "Cafe/OS/common/OSCommon.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
+#include "Cafe/HW/Latte/Core/Latte.h"
+#include "input/TAS/TASInput.h"
 
 namespace coreinit
 {
 	uint64 coreinit_GetMFTB()
 	{
+		if (TasInput::IsDeterministicTimeEnabled())
+		{
+			if (auto* hCPU = PPCInterpreter_getCurrentInstance(); hCPU && hCPU->global)
+				return hCPU->global->tb / 20ULL;
+			// Host-thread callers during early boot must still see forward time.
+			return PPCInterpreter_getMainCoreCycleCounter() / 20ULL;
+		}
 		// bus clock is 1/5th of core clock
 		// timer clock is 1/4th of bus clock
 		return PPCInterpreter_getMainCoreCycleCounter() / 20ULL;
@@ -364,3 +373,4 @@ namespace coreinit
 		//timeTest();
 	}
 };
+
