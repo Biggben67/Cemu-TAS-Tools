@@ -2,6 +2,8 @@
 
 namespace TCL
 {
+	void TCLResetAfterTimelineLoad();
+
 	enum class TCLTimestampId
 	{
 		TIMESTAMP_LAST_BUFFER_RETIRED = 1,
@@ -25,3 +27,4 @@ namespace TCL
 	COSModule* GetModule();
 }
 ENABLE_BITMASK_OPERATORS(TCL::TCLSubmissionFlag);
+
