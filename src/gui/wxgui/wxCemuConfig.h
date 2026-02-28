@@ -127,11 +127,28 @@ struct wxCemuConfig
 		sHotkeyCfg exitFullscreen;
 		sHotkeyCfg takeScreenshot;
 		sHotkeyCfg toggleFastForward;
+		sHotkeyCfg frameAdvancePause;
+		sHotkeyCfg frameAdvanceStep;
+		sHotkeyCfg toggleMovieRecordPolicy;
 		sHotkeyCfg exitApplication;
 #ifdef CEMU_DEBUG_ASSERT
 		sHotkeyCfg endEmulation;
 #endif
 	} hotkeys{};
+
+	// tas / Timelines
+	struct
+	{
+		ConfigValue<bool> input_playback_enabled{false};
+		ConfigValue<bool> input_playback_loop{false};
+		ConfigValue<bool> strict_tas_mode{false};
+		ConfigValue<bool> deterministic_scheduler{false};
+		ConfigValue<bool> deterministic_time{false};
+		ConfigValue<uint32> movie_mode{0}; // 0=disabled, 1=playback, 2=record
+		ConfigValue<uint32> movie_record_policy{0}; // 0=read-only, 1=read-write
+		std::string input_playback_file;
+		std::string game_boot_file;
+	} tas{};
 
 	void AddRecentlyLaunchedFile(std::string_view file);
 	void AddRecentNfcFile(std::string_view file);
@@ -153,3 +170,5 @@ inline wxCemuConfig& GetWxGUIConfig()
 {
 	return GetWxGuiConfigHandle().Data();
 }
+
+
