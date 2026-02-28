@@ -15,6 +15,7 @@
 #include "util/helpers/SystemException.h"
 #include "Common/cpu_features.h"
 #include "input/InputManager.h"
+#include "input/TAS/TASInput.h"
 #include "Cafe/CafeSystem.h"
 #include "Cafe/TitleList/TitleList.h"
 #include "Cafe/TitleList/GameInfo.h"
@@ -264,6 +265,8 @@ void InfoLog_PrintActiveSettings()
 	}
 #endif
 	cemuLog_log(LogType::Force, "Console language: {}", stdx::to_underlying(config.console_language.GetValue()));
+	cemuLog_log(LogType::Force, "TAS deterministic scheduler: {}", TasInput::IsDeterministicSchedulerEnabled() ? "true" : "false");
+	cemuLog_log(LogType::Force, "TAS deterministic time base: {}", TasInput::IsDeterministicTimeEnabled() ? "true" : "false");
 }
 
 struct SharedDataEntry
@@ -370,19 +373,31 @@ void cemu_initForGame()
 	// input manager apply game profile
 	InputManager::instance().apply_game_profile();
 	// determine cycle offset since 1.1.2000
-	uint64 secondsSince2000_UTC = (uint64)(time(NULL) - 946684800);
-	ppcCyclesSince2000_UTC = secondsSince2000_UTC * (uint64)ESPRESSO_CORE_CLOCK;
-	time_t theTime = (time(NULL) - 946684800);
+	if (TasInput::IsDeterministicTimeEnabled())
 	{
-		tm* lt = localtime(&theTime);
-#if BOOST_OS_WINDOWS
-		theTime = _mkgmtime(lt);
-#else
-		theTime = timegm(lt);
-#endif
+		// Keep deterministic runs stable, but non-zero to satisfy coreinit system-info
+		// assumptions and avoid startup asserts in time-dependent code paths.
+		constexpr uint64 kDeterministicSecondsSince2000 = 24ull * 60ull * 60ull; // Jan 2, 2000 00:00:00
+		ppcCyclesSince2000_UTC = kDeterministicSecondsSince2000 * (uint64)ESPRESSO_CORE_CLOCK;
+		ppcCyclesSince2000 = ppcCyclesSince2000_UTC;
+		ppcCyclesSince2000TimerClock = ppcCyclesSince2000 / 20ULL;
 	}
-	ppcCyclesSince2000 = theTime * (uint64)ESPRESSO_CORE_CLOCK;
-	ppcCyclesSince2000TimerClock = ppcCyclesSince2000 / 20ULL;
+	else
+	{
+		uint64 secondsSince2000_UTC = (uint64)(time(NULL) - 946684800);
+		ppcCyclesSince2000_UTC = secondsSince2000_UTC * (uint64)ESPRESSO_CORE_CLOCK;
+		time_t theTime = (time(NULL) - 946684800);
+		{
+			tm* lt = localtime(&theTime);
+#if BOOST_OS_WINDOWS
+			theTime = _mkgmtime(lt);
+#else
+			theTime = timegm(lt);
+#endif
+		}
+		ppcCyclesSince2000 = theTime * (uint64)ESPRESSO_CORE_CLOCK;
+		ppcCyclesSince2000TimerClock = ppcCyclesSince2000 / 20ULL;
+	}
 	PPCTimer_start();
 	// coreinit is bootstrapped first and then the main game executable is loaded
 	RPLLoader_LoadCoreinit();
@@ -445,6 +460,8 @@ namespace CafeSystem
 	std::optional<std::vector<std::string>> s_overrideArgs;
 
 	bool sSystemRunning = false;
+	static std::mutex sShutdownMutex;
+	static bool sShutdownInProgress = false;
 	TitleId sForegroundTitleId = 0;
 
 	GameInfo2 sGameInfo_ForegroundTitle;
@@ -851,8 +868,45 @@ namespace CafeSystem
 		for(auto& module : s_iosuModules)
 			module->TitleStart();
 		cemu_initForGame();
+		const bool forceTasDeterministicSingleCore = TasInput::IsDeterministicSchedulerEnabled();
+		const bool strictTasMode = TasInput::IsStrictTasModeEnabled();
+		if (forceTasDeterministicSingleCore)
+		{
+			if (ActiveSettings::GetTimerShiftFactor() != 3)
+			{
+				ActiveSettings::SetTimerShiftFactor(3);
+				cemuLog_log(LogType::Force, "TAS deterministic mode: forcing timer speed to 1x");
+			}
+			if (strictTasMode && GetConfig().async_compile.GetValue())
+			{
+				GetConfig().async_compile = false;
+				cemuLog_log(LogType::Force, "TAS strict mode: disabling async shader/pipeline compile");
+			}
+			if (strictTasMode && !GetConfig().gx2drawdone_sync.GetValue())
+			{
+				GetConfig().gx2drawdone_sync = true;
+				cemuLog_log(LogType::Force, "TAS strict mode: forcing full sync at GX2DrawDone");
+			}
+#if BOOST_OS_WINDOWS
+			if (strictTasMode && !GetConfig().vk_accurate_barriers.GetValue())
+			{
+				GetConfig().vk_accurate_barriers = true;
+				cemuLog_log(LogType::Force, "TAS strict mode: forcing accurate Vulkan barriers");
+			}
+#endif
+			if (ppcThreadQuantum != GameProfile::kThreadQuantumDefault)
+			{
+				ppcThreadQuantum = GameProfile::kThreadQuantumDefault;
+				cemuLog_log(LogType::Force, "TAS deterministic mode: forcing default thread quantum {}", ppcThreadQuantum);
+			}
+			if (!strictTasMode)
+				cemuLog_log(LogType::Force, "TAS deterministic mode: strict GPU sync overrides disabled (enable strict TAS mode for maximum reproducibility)");
+			cemuLog_log(LogType::Force, "TAS deterministic scheduler active: forcing single-core scheduler for repeatability");
+		}
 		// enter scheduler
-		if ((ActiveSettings::GetCPUMode() == CPUMode::MulticoreRecompiler || LaunchSettings::ForceMultiCoreInterpreter()) && !LaunchSettings::ForceInterpreter())
+		if (!forceTasDeterministicSingleCore &&
+			(ActiveSettings::GetCPUMode() == CPUMode::MulticoreRecompiler || LaunchSettings::ForceMultiCoreInterpreter()) &&
+			!LaunchSettings::ForceInterpreter())
 			coreinit::OSSchedulerBegin(3);
 		else
 			coreinit::OSSchedulerBegin(1);
@@ -993,27 +1047,49 @@ namespace CafeSystem
 
 	void ShutdownTitle()
 	{
-		if(!sSystemRunning)
+		std::unique_lock shutdownLock(sShutdownMutex);
+		if (sShutdownInProgress)
 			return;
-        coreinit::OSSchedulerEnd();
-        Latte_Stop();
-        // reset Cafe OS userspace modules
-        snd_core::reset();
-        coreinit::OSAlarm_Shutdown();
-        GX2::_GX2DriverReset();
-        nn::save::ResetToDefaultState();
-        coreinit::__OSDeleteAllActivePPCThreads();
-        RPLLoader_UnloadAll();
-		for(auto it = s_iosuModules.rbegin(); it != s_iosuModules.rend(); ++it)
-			(*it)->TitleStop();
-        // reset Cemu subsystems
-        PPCRecompiler_Shutdown();
-        GraphicPack2::Reset();
-        UnmountCurrentTitle();
-        MlcStorageUnmountAllTitles();
-        UnmountBaseDirectories();
-        DestroyMemorySpace();
-		sSystemRunning = false;
+		sShutdownInProgress = true;
+		shutdownLock.unlock();
+
+		TasInput::SetFrameAdvancePaused(false);
+		if(!sSystemRunning)
+		{
+			shutdownLock.lock();
+			sShutdownInProgress = false;
+			return;
+		}
+		try
+		{
+	        coreinit::OSSchedulerEnd();
+	        Latte_Stop();
+	        // reset Cafe OS userspace modules
+	        snd_core::reset();
+	        coreinit::OSAlarm_Shutdown();
+	        GX2::_GX2DriverReset();
+	        nn::save::ResetToDefaultState();
+	        coreinit::__OSDeleteAllActivePPCThreads();
+	        RPLLoader_UnloadAll();
+			for(auto it = s_iosuModules.rbegin(); it != s_iosuModules.rend(); ++it)
+				(*it)->TitleStop();
+	        // reset Cemu subsystems
+	        PPCRecompiler_Shutdown();
+	        GraphicPack2::Reset();
+	        UnmountCurrentTitle();
+	        MlcStorageUnmountAllTitles();
+	        UnmountBaseDirectories();
+	        DestroyMemorySpace();
+			sSystemRunning = false;
+		}
+		catch (...)
+		{
+			cemuLog_log(LogType::Force, "ShutdownTitle: exception during shutdown sequence");
+			sSystemRunning = false;
+		}
+
+		shutdownLock.lock();
+		sShutdownInProgress = false;
 	}
 
 	/* Virtual mlc storage */
@@ -1115,3 +1191,7 @@ namespace CafeSystem
 	}
 
 }
+
+
+
+
