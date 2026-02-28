@@ -13,6 +13,7 @@
 #include <wx/cshelp.h>
 #include <wx/textctrl.h>
 #include <wx/textdlg.h>
+#include <wx/filedlg.h>
 #include <wx/hyperlink.h>
 
 #include "config/CemuConfig.h"
@@ -45,6 +46,8 @@
 #include "config/LaunchSettings.h"
 #include "config/ActiveSettings.h"
 #include "wxgui/helpers/wxHelpers.h"
+#include "wxgui/input/HotkeySettings.h"
+#include "input/TAS/TASInput.h"
 
 #include "resource/embedded/resources.h"
 
@@ -68,6 +71,31 @@ const wxString kPropertyEmail("Email");
 const wxString kPropertyCountry("Country");
 
 wxDEFINE_EVENT(wxEVT_ACCOUNTLIST_REFRESH, wxCommandEvent);
+
+namespace
+{
+	wxString FormatHotkeySummary(const sHotkeyCfg& pause, const sHotkeyCfg& step, const sHotkeyCfg& mode)
+	{
+		auto formatKeyboard = [](uKeyboardHotkey hotkey) -> wxString
+		{
+			if (hotkey.raw == sHotkeyCfg::keyboardNone)
+				return _("----");
+
+			wxString ret;
+			if (hotkey.alt)
+				ret.append(_("Alt + "));
+			if (hotkey.ctrl)
+				ret.append(_("Ctrl + "));
+			if (hotkey.shift)
+				ret.append(_("Shift + "));
+			ret.append(wxAcceleratorEntry(0, hotkey.key).ToString());
+			return ret;
+		};
+
+		return formatWxString(_("Pause: {} | Step: {} | Mode: {}"),
+			formatKeyboard(pause.keyboard), formatKeyboard(step.keyboard), formatKeyboard(mode.keyboard));
+	}
+}
 
 class wxDeviceDescription : public wxClientData
 {
@@ -986,6 +1014,85 @@ wxPanel* GeneralSettings2::AddAccountPage(wxNotebook* notebook)
 	return online_panel;
 }
 
+wxPanel* GeneralSettings2::AddTASPage(wxNotebook* notebook)
+{
+	auto* panel = new wxPanel(notebook, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
+	auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+	auto* box = new wxStaticBox(panel, wxID_ANY, _("Timelines"));
+	auto* boxSizer = new wxStaticBoxSizer(box, wxVERTICAL);
+
+	m_tas_mode = new wxCheckBox(box, wxID_ANY, _("TAS Mode"));
+	m_tas_mode->SetToolTip(_("Enable deterministic TAS behavior for playback/recording."));
+	boxSizer->Add(m_tas_mode, 0, wxALL | wxEXPAND, 5);
+
+	{
+		auto* row = new wxFlexGridSizer(0, 2, 0, 0);
+		row->SetFlexibleDirection(wxBOTH);
+		row->SetNonFlexibleGrowMode(wxFLEX_GROWMODE_SPECIFIED);
+
+		row->Add(new wxStaticText(box, wxID_ANY, _("Movie mode")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+		wxString movieModeChoices[] = {_("Disabled"), _("Playback"), _("Record")};
+		m_tas_movie_mode = new wxChoice(box, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(movieModeChoices), movieModeChoices);
+		row->Add(m_tas_movie_mode, 0, wxALL | wxEXPAND, 5);
+		boxSizer->Add(row, 0, wxALL | wxEXPAND, 0);
+	}
+
+	{
+		auto* row = new wxFlexGridSizer(0, 2, 0, 0);
+		row->SetFlexibleDirection(wxBOTH);
+		row->SetNonFlexibleGrowMode(wxFLEX_GROWMODE_SPECIFIED);
+
+		row->Add(new wxStaticText(box, wxID_ANY, _("Timeline movie policy")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+		wxString movieStatePolicyChoices[] = {_("Read-only"), _("Read+Write (rerecord)")};
+		m_tas_movie_record_policy = new wxChoice(box, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(movieStatePolicyChoices), movieStatePolicyChoices);
+		row->Add(m_tas_movie_record_policy, 0, wxALL | wxEXPAND, 5);
+		boxSizer->Add(row, 0, wxALL | wxEXPAND, 0);
+	}
+
+	{
+		auto* row = new wxBoxSizer(wxHORIZONTAL);
+		m_tas_movie_play = new wxButton(box, wxID_ANY, _("Play recording"));
+		m_tas_movie_play->Bind(wxEVT_BUTTON, &GeneralSettings2::OnTasMoviePlay, this);
+		row->Add(m_tas_movie_play, 0, wxALL, 5);
+
+		m_tas_movie_record = new wxButton(box, wxID_ANY, _("Start recording"));
+		m_tas_movie_record->Bind(wxEVT_BUTTON, &GeneralSettings2::OnTasMovieRecord, this);
+		row->Add(m_tas_movie_record, 0, wxALL, 5);
+
+		boxSizer->Add(row, 0, wxALL | wxEXPAND, 0);
+	}
+
+	{
+		auto* row = new wxBoxSizer(wxHORIZONTAL);
+		m_tas_movie_export = new wxButton(box, wxID_ANY, _("Export .ctm..."));
+		m_tas_movie_export->Bind(wxEVT_BUTTON, &GeneralSettings2::OnTasMovieExport, this);
+		row->Add(m_tas_movie_export, 0, wxALL, 5);
+
+		boxSizer->Add(row, 0, wxALL | wxEXPAND, 0);
+	}
+
+	boxSizer->Add(new wxStaticText(box, wxID_ANY, _("CSV format: frame[,player],lx,ly,rx,ry,zl,zr,buttons  (buttons: A|B|X|Y|L|R|ZL|ZR|PLUS|MINUS|UP|DOWN|LEFT|RIGHT|STICKL|STICKR|HOME)")), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+
+	{
+		auto* row = new wxBoxSizer(wxHORIZONTAL);
+		m_tas_hotkey_summary = new wxStaticText(box, wxID_ANY, wxEmptyString);
+		row->Add(m_tas_hotkey_summary, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+
+		m_tas_open_hotkey_settings = new wxButton(box, wxID_ANY, _("Configure hotkeys..."));
+		m_tas_open_hotkey_settings->Bind(wxEVT_BUTTON, &GeneralSettings2::OnOpenTasHotkeySettings, this);
+		row->Add(m_tas_open_hotkey_settings, 0, wxALIGN_CENTER_VERTICAL);
+
+		boxSizer->Add(row, 0, wxALL | wxEXPAND, 5);
+	}
+
+	boxSizer->Add(new wxStaticText(box, wxID_ANY, _("TAS hotkeys are global and can also be changed in Options -> Hotkey settings.")), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+
+	sizer->Add(boxSizer, 0, wxALL | wxEXPAND, 5);
+	panel->SetSizerAndFit(sizer);
+	return panel;
+}
+
 wxPanel* GeneralSettings2::AddDebugPage(wxNotebook* notebook)
 {
 	auto* panel = new wxPanel(notebook, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
@@ -1274,6 +1381,20 @@ void GeneralSettings2::StoreConfig()
 	config.notification.controller_battery = m_controller_low_battery->GetValue();
 	config.notification.shader_compiling = m_shader_compiling->GetValue();
 	config.notification.friends = m_friends_data->GetValue();
+
+	if (m_tas_mode)
+	{
+		wxGuiConfig.tas.input_playback_enabled = true;
+		wxGuiConfig.tas.input_playback_loop = false;
+		wxGuiConfig.tas.strict_tas_mode = m_tas_mode->GetValue();
+		wxGuiConfig.tas.deterministic_scheduler = wxGuiConfig.tas.strict_tas_mode.GetValue();
+		wxGuiConfig.tas.deterministic_time = wxGuiConfig.tas.strict_tas_mode.GetValue();
+		wxGuiConfig.tas.movie_mode = std::clamp<uint32>((uint32)m_tas_movie_mode->GetSelection(), 0, 2);
+		wxGuiConfig.tas.movie_record_policy = std::clamp<uint32>((uint32)m_tas_movie_record_policy->GetSelection(), 0, 1);
+		if (wxGuiConfig.tas.movie_record_policy == 1)
+			wxGuiConfig.tas.movie_mode = 2;
+		TasInput::ReloadFromConfig();
+	}
 
 	// account
 	config.account.m_persistent_id = GetSelectedAccountPersistentId();
@@ -1919,6 +2040,15 @@ void GeneralSettings2::ApplyConfig()
 	m_shader_compiling->SetValue(config.notification.shader_compiling);
 	m_friends_data->SetValue(config.notification.friends);
 
+	if (m_tas_mode)
+	{
+		const bool tasMode = wxGUIconfig.tas.strict_tas_mode || wxGUIconfig.tas.deterministic_scheduler || wxGUIconfig.tas.deterministic_time;
+		m_tas_mode->SetValue(tasMode);
+		m_tas_movie_mode->SetSelection(std::clamp<int>((int)wxGUIconfig.tas.movie_mode.GetValue(), 0, 2));
+		m_tas_movie_record_policy->SetSelection(std::clamp<int>((int)wxGUIconfig.tas.movie_record_policy.GetValue(), 0, 1));
+		m_tas_hotkey_summary->SetLabelText(FormatHotkeySummary(wxGUIconfig.hotkeys.frameAdvancePause, wxGUIconfig.hotkeys.frameAdvanceStep, wxGUIconfig.hotkeys.toggleMovieRecordPolicy));
+	}
+
 	// audio
 	if(config.audio_api == IAudioAPI::DirectSound)
 		m_audio_api->SetStringSelection(kDirectSound);
@@ -2308,6 +2438,72 @@ void GeneralSettings2::OnAccountServiceChanged(wxCommandEvent& event)
 	UpdateAccountInformation();
 }
 
+void GeneralSettings2::OnOpenTasHotkeySettings(wxCommandEvent& event)
+{
+	auto* frame = new HotkeySettings(this);
+	frame->Show();
+	frame->Raise();
+
+	const auto& wxGUIconfig = GetWxGUIConfig();
+	m_tas_hotkey_summary->SetLabelText(FormatHotkeySummary(wxGUIconfig.hotkeys.frameAdvancePause, wxGUIconfig.hotkeys.frameAdvanceStep, wxGUIconfig.hotkeys.toggleMovieRecordPolicy));
+}
+
+void GeneralSettings2::OnTasMoviePlay(wxCommandEvent& event)
+{
+	wxFileDialog dialog(this, _("Select TAS movie to play"), wxEmptyString, wxEmptyString,
+		_("TAS movie (*.ctm)|*.ctm|TAS CSV (*.csv)|*.csv|All files (*.*)|*.*"), wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+	if (dialog.ShowModal() != wxID_OK)
+		return;
+
+	m_tas_mode->SetValue(true);
+	m_tas_movie_mode->SetSelection(1); // Playback
+	auto& wxGuiConfig = GetWxGUIConfig();
+	wxGuiConfig.tas.input_playback_enabled = true;
+	wxGuiConfig.tas.input_playback_loop = false;
+	wxGuiConfig.tas.strict_tas_mode = true;
+	wxGuiConfig.tas.deterministic_scheduler = true;
+	wxGuiConfig.tas.deterministic_time = true;
+	wxGuiConfig.tas.movie_mode = 1;
+	wxGuiConfig.tas.input_playback_file = _pathToUtf8(wxHelper::MakeFSPath(dialog.GetPath()));
+	GetConfigHandle().Save();
+	TasInput::ReloadFromConfig();
+	std::string error;
+	if (!TasInput::ImportMovieForPlaybackFromFile(wxHelper::MakeFSPath(dialog.GetPath()), error, true))
+		wxMessageBox(wxString::FromUTF8(error.c_str()), _("Error"), wxOK | wxCENTRE | wxICON_ERROR, this);
+}
+
+void GeneralSettings2::OnTasMovieRecord(wxCommandEvent& event)
+{
+	m_tas_mode->SetValue(true);
+	m_tas_movie_mode->SetSelection(2); // Record
+	auto& wxGuiConfig = GetWxGUIConfig();
+	wxGuiConfig.tas.input_playback_enabled = true;
+	wxGuiConfig.tas.input_playback_loop = false;
+	wxGuiConfig.tas.strict_tas_mode = true;
+	wxGuiConfig.tas.deterministic_scheduler = true;
+	wxGuiConfig.tas.deterministic_time = true;
+	wxGuiConfig.tas.movie_mode = 2;
+	GetConfigHandle().Save();
+	TasInput::ReloadFromConfig();
+	TasInput::SetManualInputEnabled(true);
+}
+
+void GeneralSettings2::OnTasMovieExport(wxCommandEvent& event)
+{
+	wxString defaultName = "movie.ctm";
+	wxFileDialog dialog(this, _("Export TAS movie"), wxEmptyString, defaultName,
+		_("Cemu TAS movie (*.ctm)|*.ctm|All files (*.*)|*.*"), wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+	if (dialog.ShowModal() != wxID_OK)
+		return;
+
+	std::string error;
+	if (!TasInput::ExportMovieToFile(wxHelper::MakeFSPath(dialog.GetPath()), error))
+	{
+		wxMessageBox(wxString::FromUTF8(error.c_str()), _("Error"), wxOK | wxCENTRE | wxICON_ERROR, this);
+		return;
+	}
+}
+
 void GeneralSettings2::OnMLCPathSelect(wxCommandEvent& event)
 {
 	if(CafeSystem::IsTitleRunning())
@@ -2448,3 +2644,4 @@ wxString GeneralSettings2::GetOnlineAccountErrorMessage(OnlineAccountError error
 			return "no error";
 	}
 }
+
