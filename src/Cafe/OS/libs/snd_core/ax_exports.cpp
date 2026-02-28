@@ -8,6 +8,20 @@
 namespace snd_core
 {
 	sndGeneric_t sndGeneric;
+	extern sint32 __AXDeviceUpsampleStage[AX_DEV_COUNT];
+	extern sint32 __AXMode[AX_DEV_COUNT];
+	extern uint16 __AXTVAuxReturnVolume[AX_AUX_BUS_COUNT];
+	extern MPTR __AXFrameCallback;
+	extern MPTR __AXAppFrameCallback[AX_APP_FRAME_CALLBACK_MAX];
+	extern MPTR __AXDeviceFinalMixCallback[AX_DEV_COUNT];
+	extern MPTR __AXAuxDRCCallbackFunc[AX_AUX_BUS_COUNT * 2];
+	extern MPTR __AXAuxDRCCallbackUserParam[AX_AUX_BUS_COUNT * 2];
+	extern MPTR __AXAuxTVCallbackFunc[AX_AUX_BUS_COUNT];
+	extern MPTR __AXAuxTVCallbackUserParam[AX_AUX_BUS_COUNT];
+	extern MPTR __AXOldAuxDRCCallbackFunc[AX_AUX_BUS_COUNT * 2];
+	extern MPTR __AXOldAuxDRCCallbackUserParam[AX_AUX_BUS_COUNT * 2];
+	extern MPTR __AXOldAuxTVCallbackFunc[AX_AUX_BUS_COUNT];
+	extern MPTR __AXOldAuxTVCallbackUserParam[AX_AUX_BUS_COUNT];
 
 	void AXResetToDefaultState()
 	{
@@ -519,6 +533,92 @@ namespace snd_core
         sndGeneric.isInitialized = false;
 	}
 
+	void CaptureTimelineRuntime(TimelineRuntimeSnapshot& outSnapshot)
+	{
+		outSnapshot = {};
+		outSnapshot.valid = true;
+		outSnapshot.isInitialized = sndGeneric.isInitialized;
+		outSnapshot.isSoundCore2 = sndGeneric.isSoundCore2;
+		outSnapshot.rendererFreq = sndGeneric.initParam.rendererFreq;
+		outSnapshot.frameLength = sndGeneric.initParam.frameLength;
+		outSnapshot.pipelineMode = sndGeneric.initParam.pipelineMode;
+		for (size_t i = 0; i < AX_DEV_COUNT; ++i)
+		{
+			outSnapshot.deviceUpsampleStage[i] = __AXDeviceUpsampleStage[i];
+			outSnapshot.deviceFinalMixCallbacks[i] = __AXDeviceFinalMixCallback[i];
+			outSnapshot.deviceMode[i] = __AXMode[i];
+		}
+		for (size_t i = 0; i < AX_AUX_BUS_COUNT; ++i)
+			outSnapshot.tvAuxReturnVolume[i] = __AXTVAuxReturnVolume[i];
+		outSnapshot.frameCallback = __AXFrameCallback;
+		for (size_t i = 0; i < AX_APP_FRAME_CALLBACK_MAX; ++i)
+			outSnapshot.appFrameCallbacks[i] = __AXAppFrameCallback[i];
+		for (size_t i = 0; i < AX_AUX_BUS_COUNT; ++i)
+		{
+			outSnapshot.auxTvCallbackFunc[i] = __AXAuxTVCallbackFunc[i];
+			outSnapshot.auxTvCallbackUserParam[i] = __AXAuxTVCallbackUserParam[i];
+			outSnapshot.oldAuxTvCallbackFunc[i] = __AXOldAuxTVCallbackFunc[i];
+			outSnapshot.oldAuxTvCallbackUserParam[i] = __AXOldAuxTVCallbackUserParam[i];
+		}
+		for (size_t i = 0; i < AX_AUX_BUS_COUNT * 2; ++i)
+		{
+			outSnapshot.auxDrcCallbackFunc[i] = __AXAuxDRCCallbackFunc[i];
+			outSnapshot.auxDrcCallbackUserParam[i] = __AXAuxDRCCallbackUserParam[i];
+			outSnapshot.oldAuxDrcCallbackFunc[i] = __AXOldAuxDRCCallbackFunc[i];
+			outSnapshot.oldAuxDrcCallbackUserParam[i] = __AXOldAuxDRCCallbackUserParam[i];
+		}
+	}
+
+	void RestoreTimelineRuntime(const TimelineRuntimeSnapshot& snapshot)
+	{
+		if (!snapshot.valid)
+			return;
+
+		sndGeneric.isInitialized = snapshot.isInitialized;
+		sndGeneric.isSoundCore2 = snapshot.isSoundCore2;
+		sndGeneric.initParam.rendererFreq = snapshot.rendererFreq;
+		sndGeneric.initParam.frameLength = snapshot.frameLength;
+		sndGeneric.initParam.pipelineMode = snapshot.pipelineMode;
+
+		if (!snapshot.isInitialized)
+		{
+			AXResetCallbacks();
+			AXOut_resyncFrameQueue();
+			return;
+		}
+
+		// Do not reinitialize AX runtime modules here: the AX thread is already
+		// alive in the current session and hard reinit can race with live audio
+		// processing right after a state load.
+		for (size_t i = 0; i < AX_DEV_COUNT; ++i)
+		{
+			__AXDeviceUpsampleStage[i] = snapshot.deviceUpsampleStage[i];
+			__AXDeviceFinalMixCallback[i] = snapshot.deviceFinalMixCallbacks[i];
+			__AXMode[i] = snapshot.deviceMode[i];
+		}
+		for (size_t i = 0; i < AX_AUX_BUS_COUNT; ++i)
+			__AXTVAuxReturnVolume[i] = snapshot.tvAuxReturnVolume[i];
+		__AXFrameCallback = snapshot.frameCallback;
+		for (size_t i = 0; i < AX_APP_FRAME_CALLBACK_MAX; ++i)
+			__AXAppFrameCallback[i] = snapshot.appFrameCallbacks[i];
+		for (size_t i = 0; i < AX_AUX_BUS_COUNT; ++i)
+		{
+			__AXAuxTVCallbackFunc[i] = snapshot.auxTvCallbackFunc[i];
+			__AXAuxTVCallbackUserParam[i] = snapshot.auxTvCallbackUserParam[i];
+			__AXOldAuxTVCallbackFunc[i] = snapshot.oldAuxTvCallbackFunc[i];
+			__AXOldAuxTVCallbackUserParam[i] = snapshot.oldAuxTvCallbackUserParam[i];
+		}
+		for (size_t i = 0; i < AX_AUX_BUS_COUNT * 2; ++i)
+		{
+			__AXAuxDRCCallbackFunc[i] = snapshot.auxDrcCallbackFunc[i];
+			__AXAuxDRCCallbackUserParam[i] = snapshot.auxDrcCallbackUserParam[i];
+			__AXOldAuxDRCCallbackFunc[i] = snapshot.oldAuxDrcCallbackFunc[i];
+			__AXOldAuxDRCCallbackUserParam[i] = snapshot.oldAuxDrcCallbackUserParam[i];
+		}
+
+		AXOut_resyncFrameQueue();
+	}
+
 	void RegisterVoiceFunctions()
 	{
 		// snd_core
@@ -764,3 +864,4 @@ namespace snd_core
 	}
 
 }
+
