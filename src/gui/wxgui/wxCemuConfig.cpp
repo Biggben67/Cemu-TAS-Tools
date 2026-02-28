@@ -115,10 +115,24 @@ void wxCemuConfig::Load(XMLConfigParser& parser)
 	hotkeys.toggleFullscreenAlt = xml_hotkeys.get("ToggleFullscreenAlt", sHotkeyCfg{uKeyboardHotkey{WXK_CONTROL_M, true}}); // ALT+ENTER
 	hotkeys.takeScreenshot = xml_hotkeys.get("TakeScreenshot", sHotkeyCfg{uKeyboardHotkey{WXK_F12}});
 	hotkeys.toggleFastForward = xml_hotkeys.get("ToggleFastForward", sHotkeyCfg{});
+	hotkeys.frameAdvancePause = xml_hotkeys.get("FrameAdvancePause", sHotkeyCfg{});
+	hotkeys.frameAdvanceStep = xml_hotkeys.get("FrameAdvanceStep", sHotkeyCfg{});
+	hotkeys.toggleMovieRecordPolicy = xml_hotkeys.get("ToggleMovieRecordPolicy", sHotkeyCfg{});
 	hotkeys.exitApplication = xml_hotkeys.get("ExitApplication", sHotkeyCfg{});
 #ifdef CEMU_DEBUG_ASSERT
 	hotkeys.endEmulation = xml_hotkeys.get("EndEmulation", sHotkeyCfg{uKeyboardHotkey{WXK_F5}});
 #endif
+
+	auto xml_tas = parser.get("TasTools");
+	tas.input_playback_enabled = xml_tas.get("InputPlaybackEnabled", tas.input_playback_enabled);
+	tas.input_playback_loop = xml_tas.get("InputPlaybackLoop", tas.input_playback_loop);
+	tas.strict_tas_mode = xml_tas.get("StrictTasMode", tas.strict_tas_mode);
+	tas.deterministic_scheduler = xml_tas.get("DeterministicScheduler", tas.deterministic_scheduler);
+	tas.deterministic_time = xml_tas.get("DeterministicTime", tas.deterministic_time);
+	tas.movie_mode = xml_tas.get("MovieMode", tas.movie_mode);
+	tas.movie_record_policy = xml_tas.get("MovieRecordPolicy", tas.movie_record_policy);
+	tas.input_playback_file = xml_tas.get("InputPlaybackFile", tas.input_playback_file);
+	tas.game_boot_file = xml_tas.get("GameBootFile", tas.game_boot_file);
 }
 
 void wxCemuConfig::Save(XMLConfigParser& config)
@@ -186,5 +200,21 @@ void wxCemuConfig::Save(XMLConfigParser& config)
 	xml_hotkeys.set("ToggleFullscreenAlt", hotkeys.toggleFullscreenAlt);
 	xml_hotkeys.set("TakeScreenshot", hotkeys.takeScreenshot);
 	xml_hotkeys.set("ToggleFastForward", hotkeys.toggleFastForward);
+	xml_hotkeys.set("FrameAdvancePause", hotkeys.frameAdvancePause);
+	xml_hotkeys.set("FrameAdvanceStep", hotkeys.frameAdvanceStep);
+	xml_hotkeys.set("ToggleMovieRecordPolicy", hotkeys.toggleMovieRecordPolicy);
 	xml_hotkeys.set("ExitApplication", hotkeys.exitApplication);
+
+	auto xml_tas = config.set("TasTools");
+	xml_tas.set("InputPlaybackEnabled", tas.input_playback_enabled.GetValue());
+	xml_tas.set("InputPlaybackLoop", tas.input_playback_loop.GetValue());
+	xml_tas.set("StrictTasMode", tas.strict_tas_mode.GetValue());
+	xml_tas.set("DeterministicScheduler", tas.deterministic_scheduler.GetValue());
+	xml_tas.set("DeterministicTime", tas.deterministic_time.GetValue());
+	xml_tas.set("MovieMode", tas.movie_mode.GetValue());
+	xml_tas.set("MovieRecordPolicy", tas.movie_record_policy.GetValue());
+	xml_tas.set("InputPlaybackFile", tas.input_playback_file);
+	xml_tas.set("GameBootFile", tas.game_boot_file);
 }
+
+
