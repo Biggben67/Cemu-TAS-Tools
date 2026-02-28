@@ -8,6 +8,7 @@
 namespace coreinit
 {
 	static constexpr inline size_t IPC_NUM_RESOURCE_BUFFERS = 0x30;
+	static bool s_reportedInvalidIpcContext = false;
 	
 	struct IPCResourceBuffer
 	{
@@ -364,84 +365,120 @@ namespace coreinit
 		return IOS_ERROR_OK;
 	}
 
+	IPCDriver* IPCDriver_TryGetForCurrentContext()
+	{
+		if (PPCInterpreter_getCurrentInstance() == nullptr)
+		{
+			if (!s_reportedInvalidIpcContext)
+			{
+				s_reportedInvalidIpcContext = true;
+				cemuLog_log(LogType::Force, "coreinit_ipc: ignoring IOS_* call without PPC interpreter context");
+			}
+			return nullptr;
+		}
+		const sint32 coreId = OSGetCoreId();
+		if (coreId < 0 || coreId >= (sint32)Espresso::CORE_COUNT)
+		{
+			if (!s_reportedInvalidIpcContext)
+			{
+				s_reportedInvalidIpcContext = true;
+				cemuLog_log(LogType::Force, "coreinit_ipc: ignoring IOS_* call with invalid core id {}", coreId);
+			}
+			return nullptr;
+		}
+		return &IPCDriver_GetByCore((uint32)coreId);
+	}
+
 	IOSDevHandle IOS_Open(const char* devicePath, uint32 flags)
 	{
-		IPCDriver& ipcDriver = IPCDriver_GetByCore(OSGetCoreId());
-		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(&ipcDriver, 0, IPCCommandId::IOS_OPEN, nullptr, nullptr, nullptr);
-		_IPCDriver_SetupCmd_IOSOpen(ipcDriver, ipcDescriptor, devicePath, flags);
-		_IPCDriver_SubmitCmd(ipcDriver, ipcDescriptor);
-		uint32 r = _IPCDriver_WaitForResultAndRelease(ipcDriver, ipcDescriptor);
+		IPCDriver* ipcDriver = IPCDriver_TryGetForCurrentContext();
+		if (!ipcDriver)
+			return IOS_ERROR_INVALID_ARG;
+		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(ipcDriver, 0, IPCCommandId::IOS_OPEN, nullptr, nullptr, nullptr);
+		_IPCDriver_SetupCmd_IOSOpen(*ipcDriver, ipcDescriptor, devicePath, flags);
+		_IPCDriver_SubmitCmd(*ipcDriver, ipcDescriptor);
+		uint32 r = _IPCDriver_WaitForResultAndRelease(*ipcDriver, ipcDescriptor);
 		return r;
 	}
 
 	IOS_ERROR IOS_Close(IOSDevHandle devHandle)
 	{
-		IPCDriver& ipcDriver = IPCDriver_GetByCore(OSGetCoreId());
-		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(&ipcDriver, devHandle, IPCCommandId::IOS_CLOSE, nullptr, nullptr, nullptr);
-		_IPCDriver_SubmitCmd(ipcDriver, ipcDescriptor);
-		IOS_ERROR r = (IOS_ERROR)_IPCDriver_WaitForResultAndRelease(ipcDriver, ipcDescriptor);
+		IPCDriver* ipcDriver = IPCDriver_TryGetForCurrentContext();
+		if (!ipcDriver)
+			return IOS_ERROR_INVALID_ARG;
+		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(ipcDriver, devHandle, IPCCommandId::IOS_CLOSE, nullptr, nullptr, nullptr);
+		_IPCDriver_SubmitCmd(*ipcDriver, ipcDescriptor);
+		IOS_ERROR r = (IOS_ERROR)_IPCDriver_WaitForResultAndRelease(*ipcDriver, ipcDescriptor);
 		return r;
 	}
 
 	IOS_ERROR IOS_Ioctl(IOSDevHandle devHandle, uint32 requestId, void* ptrIn, uint32 sizeIn, void* ptrOut, uint32 sizeOut)
 	{
-		IPCDriver& ipcDriver = IPCDriver_GetByCore(OSGetCoreId());
-		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(&ipcDriver, devHandle, IPCCommandId::IOS_IOCTL, nullptr, nullptr, nullptr);
-		IOS_ERROR r = _IPCDriver_SetupCmd_IOSIoctl(ipcDriver, ipcDescriptor, requestId, ptrIn, sizeIn, ptrOut, sizeOut);
+		IPCDriver* ipcDriver = IPCDriver_TryGetForCurrentContext();
+		if (!ipcDriver)
+			return IOS_ERROR_INVALID_ARG;
+		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(ipcDriver, devHandle, IPCCommandId::IOS_IOCTL, nullptr, nullptr, nullptr);
+		IOS_ERROR r = _IPCDriver_SetupCmd_IOSIoctl(*ipcDriver, ipcDescriptor, requestId, ptrIn, sizeIn, ptrOut, sizeOut);
 		if (r != IOS_ERROR_OK)
 		{
 			cemuLog_log(LogType::Force, "IOS_Ioctl failed due to bad parameters");
-			IPCDriver_ReleaseResource(&ipcDriver, ipcDescriptor);
+			IPCDriver_ReleaseResource(ipcDriver, ipcDescriptor);
 			return r;
 		}
-		_IPCDriver_SubmitCmd(ipcDriver, ipcDescriptor);
-		r = (IOS_ERROR)_IPCDriver_WaitForResultAndRelease(ipcDriver, ipcDescriptor);
+		_IPCDriver_SubmitCmd(*ipcDriver, ipcDescriptor);
+		r = (IOS_ERROR)_IPCDriver_WaitForResultAndRelease(*ipcDriver, ipcDescriptor);
 		return r;
 	}
 
 	IOS_ERROR IOS_IoctlAsync(IOSDevHandle devHandle, uint32 requestId, void* ptrIn, uint32 sizeIn, void* ptrOut, uint32 sizeOut, MEMPTR<void> asyncResultFunc, MEMPTR<void> asyncResultUserParam)
 	{
-		IPCDriver& ipcDriver = IPCDriver_GetByCore(OSGetCoreId());
-		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(&ipcDriver, devHandle, IPCCommandId::IOS_IOCTL, nullptr, asyncResultFunc, asyncResultUserParam);
-		IOS_ERROR r = _IPCDriver_SetupCmd_IOSIoctl(ipcDriver, ipcDescriptor, requestId, ptrIn, sizeIn, ptrOut, sizeOut);
+		IPCDriver* ipcDriver = IPCDriver_TryGetForCurrentContext();
+		if (!ipcDriver)
+			return IOS_ERROR_INVALID_ARG;
+		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(ipcDriver, devHandle, IPCCommandId::IOS_IOCTL, nullptr, asyncResultFunc, asyncResultUserParam);
+		IOS_ERROR r = _IPCDriver_SetupCmd_IOSIoctl(*ipcDriver, ipcDescriptor, requestId, ptrIn, sizeIn, ptrOut, sizeOut);
 		if (r != IOS_ERROR_OK)
 		{
 			cemuLog_log(LogType::Force, "IOS_Ioctl failed due to bad parameters");
-			IPCDriver_ReleaseResource(&ipcDriver, ipcDescriptor);
+			IPCDriver_ReleaseResource(ipcDriver, ipcDescriptor);
 			return r;
 		}
-		_IPCDriver_SubmitCmd(ipcDriver, ipcDescriptor);
+		_IPCDriver_SubmitCmd(*ipcDriver, ipcDescriptor);
 		return r;
 	}
 
 	IOS_ERROR IOS_Ioctlv(IOSDevHandle devHandle, uint32 requestId, uint32 numIn, uint32 numOut, IPCIoctlVector* vec)
 	{
-		IPCDriver& ipcDriver = IPCDriver_GetByCore(OSGetCoreId());
-		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(&ipcDriver, devHandle, IPCCommandId::IOS_IOCTLV, nullptr, nullptr, nullptr);
-		IOS_ERROR r = _IPCDriver_SetupCmd_IOSIoctlv(ipcDriver, ipcDescriptor, requestId, numIn, numOut, vec);
+		IPCDriver* ipcDriver = IPCDriver_TryGetForCurrentContext();
+		if (!ipcDriver)
+			return IOS_ERROR_INVALID_ARG;
+		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(ipcDriver, devHandle, IPCCommandId::IOS_IOCTLV, nullptr, nullptr, nullptr);
+		IOS_ERROR r = _IPCDriver_SetupCmd_IOSIoctlv(*ipcDriver, ipcDescriptor, requestId, numIn, numOut, vec);
 		if (r != IOS_ERROR_OK)
 		{
 			cemuLog_log(LogType::Force, "IOS_Ioctlv failed due to bad parameters");
-			IPCDriver_ReleaseResource(&ipcDriver, ipcDescriptor);
+			IPCDriver_ReleaseResource(ipcDriver, ipcDescriptor);
 			return r;
 		}
-		_IPCDriver_SubmitCmd(ipcDriver, ipcDescriptor);
-		r = (IOS_ERROR)_IPCDriver_WaitForResultAndRelease(ipcDriver, ipcDescriptor);
+		_IPCDriver_SubmitCmd(*ipcDriver, ipcDescriptor);
+		r = (IOS_ERROR)_IPCDriver_WaitForResultAndRelease(*ipcDriver, ipcDescriptor);
 		return r;
 	}
 
 	IOS_ERROR IOS_IoctlvAsync(IOSDevHandle devHandle, uint32 requestId, uint32 numIn, uint32 numOut, IPCIoctlVector* vec, MEMPTR<void> asyncResultFunc, MEMPTR<void> asyncResultUserParam)
 	{
-		IPCDriver& ipcDriver = IPCDriver_GetByCore(OSGetCoreId());
-		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(&ipcDriver, devHandle, IPCCommandId::IOS_IOCTLV, nullptr, asyncResultFunc, asyncResultUserParam);
-		IOS_ERROR r = _IPCDriver_SetupCmd_IOSIoctlv(ipcDriver, ipcDescriptor, requestId, numIn, numOut, vec);
+		IPCDriver* ipcDriver = IPCDriver_TryGetForCurrentContext();
+		if (!ipcDriver)
+			return IOS_ERROR_INVALID_ARG;
+		IPCResourceBufferDescriptor* ipcDescriptor = IPCDriver_AllocateResource(ipcDriver, devHandle, IPCCommandId::IOS_IOCTLV, nullptr, asyncResultFunc, asyncResultUserParam);
+		IOS_ERROR r = _IPCDriver_SetupCmd_IOSIoctlv(*ipcDriver, ipcDescriptor, requestId, numIn, numOut, vec);
 		if (r != IOS_ERROR_OK)
 		{
 			cemuLog_log(LogType::Force, "IOS_Ioctlv failed due to bad parameters");
-			IPCDriver_ReleaseResource(&ipcDriver, ipcDescriptor);
+			IPCDriver_ReleaseResource(ipcDriver, ipcDescriptor);
 			return r;
 		}
-		_IPCDriver_SubmitCmd(ipcDriver, ipcDescriptor);
+		_IPCDriver_SubmitCmd(*ipcDriver, ipcDescriptor);
 		return r;
 	}
 
@@ -465,3 +502,4 @@ namespace coreinit
 	}
 
 };
+
