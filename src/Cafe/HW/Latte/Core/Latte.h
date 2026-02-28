@@ -69,6 +69,10 @@ struct LatteGPUState_t
 };
 
 extern LatteGPUState_t LatteGPUState;
+extern std::atomic_bool g_lattePauseRequested;
+extern std::atomic_bool g_lattePaused;
+extern std::atomic_uint64_t g_lattePausedPresentRequest;
+extern std::atomic_uint64_t g_lattePausedPresentCompleted;
 
 // texture
 
@@ -150,6 +154,7 @@ void LatteStreamout_FinishDrawcall(bool useDirectMemoryMode);
 
 void LatteTiming_Init();
 void LatteTiming_HandleTimedVsync();
+void LatteTiming_RebaseAfterStateLoad();
 
 // command processor
 
@@ -173,4 +178,9 @@ void LatteRenderTarget_updateViewport();
 void Latte_Start();
 void Latte_Stop();
 bool Latte_GetStopSignal(); // returns true if stop was requested or if in stopped state
+void Latte_RequestPause(bool pause);
+bool Latte_WaitUntilPaused(uint32 timeoutMs);
+uint64 Latte_RequestPausedPresentOnce();
+bool Latte_WaitForPausedPresent(uint64 requestId, uint32 timeoutMs);
 void LatteThread_Exit();
+
