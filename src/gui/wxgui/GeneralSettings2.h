@@ -42,6 +42,7 @@ private:
 	wxPanel* AddGraphicsPage(wxNotebook* notebook);
 	wxPanel* AddAudioPage(wxNotebook* notebook);
 	wxPanel* AddOverlayPage(wxNotebook* notebook);
+	wxPanel* AddTASPage(wxNotebook* notebook);
 	wxPanel* AddAccountPage(wxNotebook* notebook);
 	wxPanel* AddDebugPage(wxNotebook* notebook);
 
@@ -87,6 +88,16 @@ private:
 	wxChoice *m_tv_channels, *m_pad_channels, *m_input_channels;
 	wxChoice *m_tv_device, *m_pad_device, *m_input_device, *m_portal_device;
 
+	// TAS
+	wxCheckBox* m_tas_mode{};
+	wxChoice* m_tas_movie_mode{};
+	wxChoice* m_tas_movie_record_policy{};
+	wxButton* m_tas_movie_play{};
+	wxButton* m_tas_movie_record{};
+	wxButton* m_tas_movie_export{};
+	wxStaticText* m_tas_hotkey_summary{};
+	wxButton* m_tas_open_hotkey_settings{};
+
 	// Account
 	wxButton* m_create_account, * m_delete_account;
 	wxChoice* m_active_account;
@@ -124,6 +135,10 @@ private:
 	void OnMLCPathClear(wxCommandEvent& event);
 	void OnShowOnlineValidator(wxCommandEvent& event);
 	void OnAccountServiceChanged(wxCommandEvent& event);
+	void OnOpenTasHotkeySettings(wxCommandEvent& event);
+	void OnTasMoviePlay(wxCommandEvent& event);
+	void OnTasMovieRecord(wxCommandEvent& event);
+	void OnTasMovieExport(wxCommandEvent& event);
 	static wxString GetOnlineAccountErrorMessage(OnlineAccountError error);
 
 	uint32 GetSelectedAccountPersistentId();
@@ -139,3 +154,4 @@ private:
 	void HandleGraphicsApiSelection();
 	void ApplyConfig();
 };
+
