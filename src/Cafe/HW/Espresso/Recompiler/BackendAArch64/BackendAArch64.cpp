@@ -877,8 +877,16 @@ void* PPCRecompiler_virtualHLE(PPCInterpreter_t* ppcInterpreter, uint32 hleFuncI
 	else
 	{
 		auto hleCall = PPCInterpreter_getHLECall(hleFuncId);
-		cemu_assert(hleCall != nullptr);
-		hleCall(ppcInterpreter);
+		if (!hleCall)
+		{
+			cemuLog_log(LogType::Force, "Recompiler virtualHLE missing handler id=0x{:04x} ip=0x{:08x} lr=0x{:08x}; falling back to next instruction",
+				hleFuncId, ppcInterpreter->instructionPointer, ppcInterpreter->spr.LR);
+			PPCInterpreter_nextInstruction(ppcInterpreter);
+		}
+		else
+		{
+			hleCall(ppcInterpreter);
+		}
 	}
 	ppcInterpreter->rspTemp = prevRSPTemp;
 	return PPCInterpreter_getCurrentInstance();
@@ -1693,3 +1701,4 @@ void PPCRecompilerAArch64Gen_generateRecompilerInterfaceFunctions()
 	leaveRecompilerCode_visited_ctx.readyRE();
 	PPCRecompiler_leaveRecompilerCode_visited = leaveRecompilerCode_visited_ctx.getCode<decltype(PPCRecompiler_leaveRecompilerCode_visited)>();
 }
+
