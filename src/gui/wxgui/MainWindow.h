@@ -23,6 +23,8 @@ class TitleManager;
 class GraphicPacksWindow2;
 class EmulatedUSBDeviceFrame;
 class wxLaunchGameEvent;
+class TasInputWindow;
+class TasToolsWindow;
 
 wxDECLARE_EVENT(wxEVT_LAUNCH_GAME, wxLaunchGameEvent);
 wxDECLARE_EVENT(wxEVT_SET_WINDOW_TITLE, wxCommandEvent);
@@ -67,6 +69,7 @@ public:
 	void RestoreSettingsAfterGameExited();
 
 	bool FileLoad(const fs::path launchPath, wxLaunchGameEvent::INITIATED_BY initiatedBy);
+	bool GetSelectedGameListEntryForTas(fs::path& outPath, uint64& outTitleId) const;
 
 	[[nodiscard]] bool IsGameLaunched() const { return m_game_launched; }
 
@@ -165,6 +168,8 @@ private:
 	MemorySearcherTool* m_toolWindow = nullptr;
 	TitleManager* m_title_manager = nullptr;
 	EmulatedUSBDeviceFrame* m_usb_devices = nullptr;
+	TasInputWindow* m_tas_input_window = nullptr;
+	TasToolsWindow* m_tas_tools_window = nullptr;
 	PadViewFrame* m_padView = nullptr;
 	GraphicPacksWindow2* m_graphic_pack_window = nullptr;
 
@@ -242,3 +247,4 @@ wxDECLARE_EVENT_TABLE();
 };
 
 extern MainWindow* g_mainFrame;
+
