@@ -9,6 +9,7 @@
 #include "config/LaunchSettings.h"
 #include "wxgui/GettingStartedDialog.h"
 #include "input/InputManager.h"
+#include "input/TAS/TASInput.h"
 #include "wxgui/helpers/wxHelpers.h"
 #include "Cemu/ncrypto/ncrypto.h"
 #include "wxgui/input/HotkeySettings.h"
@@ -359,6 +360,7 @@ bool CemuApp::OnInit()
 	g_window_info.app_active = true;
 
 	HotkeySettings::Init(m_mainFrame);
+	TasInput::ReloadFromConfig();
 
 	SetTopWindow(m_mainFrame);
 	m_mainFrame->Show();
@@ -621,3 +623,4 @@ void CemuApp::ActivateApp(wxActivateEvent& event)
 	g_window_info.app_active = event.GetActive();
 	event.Skip();
 }
+
