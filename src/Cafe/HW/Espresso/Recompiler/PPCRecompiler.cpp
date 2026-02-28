@@ -609,6 +609,8 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
 {
 	if (ppcRecompilerEnabled == false)
 		return;
+	if (ppcRecompilerInstanceData == nullptr)
+		return;
 	if (startAddr >= PPC_REC_CODE_AREA_SIZE)
 		return;
 	cemu_assert_debug(endAddr >= startAddr);
@@ -619,9 +621,24 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
 	uint32 rEnd;
 	PPCRecFunction_t* rFunc;
 
-	// mark range as unvisited
-	for (uint64 currentAddr = (uint64)startAddr&~3; currentAddr < (uint64)(endAddr&~3); currentAddr += 4)
-		ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[currentAddr / 4] = PPCRecompiler_leaveRecompilerCode_unvisited;
+	// Mark only allocated lookup-table blocks as unvisited.
+	// Large-range invalidation (e.g. after Timeline load) may cover unmapped blocks.
+	uint64 currentAddr = (uint64)startAddr & ~3ULL;
+	const uint64 alignedEnd = (uint64)endAddr & ~3ULL;
+	while (currentAddr < alignedEnd)
+	{
+		const uint32 blockIndex = (uint32)(currentAddr / PPC_REC_ALLOC_BLOCK_SIZE);
+		const uint64 blockEnd = std::min(alignedEnd, ((uint64)blockIndex + 1ULL) * PPC_REC_ALLOC_BLOCK_SIZE);
+		if (!ppcRecompiler_reservedBlockMask[blockIndex])
+		{
+			currentAddr = blockEnd;
+			continue;
+		}
+		for (; currentAddr < blockEnd; currentAddr += 4)
+		{
+			ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[currentAddr / 4] = PPCRecompiler_leaveRecompilerCode_unvisited;
+		}
+	}
 
 	// add entry to invalidation queue
 	PPCRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -750,3 +767,4 @@ void PPCRecompiler_Shutdown()
         ppcRecompiler_reservedBlockMask[i] = false;
     }
 }
+
