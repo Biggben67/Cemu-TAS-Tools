@@ -972,6 +972,21 @@ namespace snd_core
 	SysAllocator<coreinit::OSMessage, 0x10> __AXIstThreadMsgArray;
 	SysAllocator<coreinit::OSMessageQueue, 1> __AXIstThreadMsgQueue;
 
+	static bool AXIst_IsMessageQueueReady()
+	{
+		OSThread_t* thread = AXIst_GetThread();
+		coreinit::OSMessageQueue* msgQueue = __AXIstThreadMsgQueue.GetPtr();
+		if (!thread || !msgQueue)
+			return false;
+		if (coreinit::OSIsThreadTerminated(thread))
+			return false;
+		if ((uint32)msgQueue->magic != (uint32)'mSgQ')
+			return false;
+		if ((uint32)msgQueue->msgCount == 0 || msgQueue->msgArray.GetPtr() == nullptr)
+			return false;
+		return true;
+	}
+
 	void AXIst_InitThread()
 	{
         __AXIstIsProcessingFrame = false;
@@ -1042,18 +1057,22 @@ namespace snd_core
 
 	SysAllocator<coreinit::OSMessage> _queueFrameMsg;
 
-	void AXIst_QueueFrame()
+	bool AXIst_QueueFrame()
 	{
+		if (!AXIst_IsMessageQueueReady())
+			return false;
 		coreinit::OSMessage* msg = _queueFrameMsg.GetPtr();
 		msg->message = 1;
 		msg->data0 = 0;
 		msg->data1 = 0;
 		msg->data2 = 0;
-		OSSendMessage(__AXIstThreadMsgQueue.GetPtr(), msg, 0);
+		return OSSendMessage(__AXIstThreadMsgQueue.GetPtr(), msg, 0) != 0;
 	}
 
 	void AXIst_StopThread()
 	{
+		if (!AXIst_IsMessageQueueReady())
+			return;
 		cemu_assert_debug(coreinit::OSIsThreadTerminated(AXIst_GetThread()) == false);
 		// request thread stop
 		coreinit::OSMessage* msg = _queueFrameMsg.GetPtr();
@@ -1071,3 +1090,4 @@ namespace snd_core
 		return __AXIstIsProcessingFrame.load();
 	}
 }
+
