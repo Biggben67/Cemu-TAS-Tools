@@ -20,6 +20,13 @@ static_assert(sizeof(FSAsyncParams) == 0xC);
 
 namespace coreinit
 {
+	struct FSClient_t;
+
+	bool FSIsIdle();
+	void FSCloseAllClientHandlesForTimelineLoad();
+	bool FSReopenAllClientHandlesAfterTimelineLoad();
+	bool FSUnregisterClientForTimelineLoad(FSClient_t* fsClient);
+
 	struct FSCmdBlockBody;
 
 	struct FSCmdQueue
@@ -300,3 +307,4 @@ namespace coreinit
 
 	void InitializeFS();
 }; // namespace coreinit
+
