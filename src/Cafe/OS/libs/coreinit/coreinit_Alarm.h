@@ -46,9 +46,11 @@ namespace coreinit
 	void OSSetPeriodicAlarm(OSAlarm_t* OSAlarm, uint64 startTick, uint64 periodTick, MPTR OSAlarmHandler);
 
 	void OSAlarm_Shutdown();
+	void OSAlarm_RebuildHostAlarmsAfterStateLoadNoLock();
 
 	void alarm_update();
 
 	void MapAlarmExports();
 	void InitializeAlarm();
 }
+
