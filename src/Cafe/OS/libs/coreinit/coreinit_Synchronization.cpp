@@ -231,6 +231,11 @@ namespace coreinit
 	void OSLockMutexInternal(OSMutex* mutex)
 	{
 		OSThread_t* currentThread = OSGetCurrentThread();
+		if (!currentThread)
+		{
+			// Host thread without PPC context: avoid ownership bookkeeping.
+			return;
+		}
 		int_fast32_t failedAttempts = 0;
 		while (true)
 		{
@@ -264,7 +269,8 @@ namespace coreinit
 	void OSLockMutex(OSMutex* mutex)
 	{
 		__OSLockScheduler();
-		OSTestThreadCancelInternal();
+		if (OSGetCurrentThread() != nullptr)
+			OSTestThreadCancelInternal();
 		OSLockMutexInternal(mutex);
 		__OSUnlockScheduler();
 	}
@@ -273,7 +279,13 @@ namespace coreinit
 	{
 		OSThread_t* currentThread = OSGetCurrentThread();
 		__OSLockScheduler();
-		OSTestThreadCancelInternal();
+		if (currentThread != nullptr)
+			OSTestThreadCancelInternal();
+		if (!currentThread)
+		{
+			__OSUnlockScheduler();
+			return true;
+		}
 		if (mutex->owner == nullptr)
 		{
 			// acquire lock
@@ -300,6 +312,13 @@ namespace coreinit
 	void OSUnlockMutexInternal(OSMutex* mutex)
 	{
 		OSThread_t* currentThread = OSGetCurrentThread();
+		if (!currentThread)
+		{
+			// Host thread without PPC context: avoid ownership bookkeeping.
+			return;
+		}
+		if (mutex->owner != currentThread)
+			return;
 		cemu_assert_debug(mutex->owner == currentThread);
 		cemu_assert_debug(mutex->lockCount > 0);
 		mutex->lockCount = mutex->lockCount - 1;
@@ -347,6 +366,12 @@ namespace coreinit
 		// releases the mutex while waiting for the condition to be signaled
 		__OSLockScheduler();
 		OSThread_t* currentThread = OSGetCurrentThread();
+		if (!currentThread)
+		{
+			cemuLog_log(LogType::Force, "OSWaitCond called without PPC thread context");
+			__OSUnlockScheduler();
+			return;
+		}
 		cemu_assert_debug(mutex->owner == currentThread);
 		sint32 prevLockCount = mutex->lockCount;
 		// unlock mutex
@@ -475,6 +500,11 @@ namespace coreinit
 	{
 		cemu_assert_debug(!__OSHasSchedulerLock());
 		OSThread_t* currentThread = OSGetCurrentThread();
+		if (!currentThread)
+		{
+			// Host thread without PPC context: avoid ownership bookkeeping.
+			return;
+		}
 		_OSFastMutex_AcquireContention(fastMutex);
 		while (true)
 		{
@@ -517,6 +547,8 @@ namespace coreinit
 	bool OSFastMutex_TryLock(OSFastMutex* fastMutex)
 	{
 		OSThread_t* currentThread = OSGetCurrentThread();
+		if (!currentThread)
+			return true;
 		_OSFastMutex_AcquireContention(fastMutex);
 		if (fastMutex->owner.atomic_compare_exchange(nullptr, currentThread))
 		{
@@ -544,6 +576,8 @@ namespace coreinit
 	{
 		cemu_assert_debug(!__OSHasSchedulerLock());
 		OSThread_t* currentThread = OSGetCurrentThread();
+		if (!currentThread)
+			return;
 		_OSFastMutex_AcquireContention(fastMutex);
 		if (fastMutex->owner != currentThread)
 		{
@@ -592,7 +626,14 @@ namespace coreinit
 	{
 		// releases the mutex while waiting for the condition to be signaled
 		__OSLockScheduler();
-		cemu_assert_debug(fastMutex->owner == OSGetCurrentThread());
+		OSThread_t* currentThread = OSGetCurrentThread();
+		if (!currentThread)
+		{
+			cemuLog_log(LogType::Force, "OSFastCond_Wait called without PPC thread context");
+			__OSUnlockScheduler();
+			return;
+		}
+		cemu_assert_debug(fastMutex->owner == currentThread);
 		sint32 prevLockCount = fastMutex->lockCount;
 		// unlock mutex
 		fastMutex->lockCount = 0;
@@ -600,7 +641,7 @@ namespace coreinit
 		if (!fastMutex->threadQueueSmall.isEmpty())
 			fastMutex->threadQueueSmall.wakeupEntireWaitQueue(false);
 		// wait on condition
-		fastCond->threadQueue.queueAndWait(OSGetCurrentThread());
+		fastCond->threadQueue.queueAndWait(currentThread);
 		// reacquire mutex
 		__OSUnlockScheduler();
 		OSFastMutex_LockInternal(fastMutex);
@@ -665,3 +706,4 @@ namespace coreinit
 	}
 
 };
+
