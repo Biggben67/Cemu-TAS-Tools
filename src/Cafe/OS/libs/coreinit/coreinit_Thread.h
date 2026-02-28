@@ -1,6 +1,8 @@
 #pragma once
 #include "Cafe/HW/Espresso/Const.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Scheduler.h"
+#include <array>
+#include <vector>
 
 struct OSThread_t;
 
@@ -87,6 +89,13 @@ typedef struct
 }crt_t; // size: 0x1D8
 
 static_assert(sizeof(crt_t) == 0x1D8, "");
+
+struct OSSchedulerHostThreadState
+{
+	MPTR thread{};
+	uint32 selectedCore{};
+	std::vector<uint8> ppcInstance;
+};
 
 #pragma pack(1)
 
@@ -610,6 +619,20 @@ namespace coreinit
 	// scheduler
 	void OSSchedulerBegin(sint32 numCPUEmulationThreads);
 	void OSSchedulerEnd();
+	bool OSSchedulerRebuildQueuesNoLock(const std::vector<MPTR>& threadList);
+	void OSSchedulerCaptureHostThreadStatesNoLock(std::vector<OSSchedulerHostThreadState>& outStates);
+	bool OSSchedulerRebuildHostThreadsNoLock(const std::vector<MPTR>& threadList);
+	bool OSSchedulerRestoreHostThreadStatesNoLock(const std::vector<OSSchedulerHostThreadState>& inStates);
+	void OSSchedulerCaptureCurrentCoreThreadsNoLock(std::array<MPTR, Espresso::CORE_COUNT>& outCurrentCoreThreads);
+	void OSSchedulerRestoreCurrentCoreThreadsNoLock(const std::array<MPTR, Espresso::CORE_COUNT>& currentCoreThreads);
+	void OSSchedulerCaptureDeterminismStateNoLock(std::array<uint32, Espresso::CORE_COUNT>& outCoreLehmerState);
+	void OSSchedulerRestoreDeterminismStateNoLock(const std::array<uint32, Espresso::CORE_COUNT>& coreLehmerState);
+	bool OSSchedulerEnsureLivenessAfterStateLoadNoLock(bool allowAggressiveEscalation = true);
+	bool OSSchedulerForceMainThreadRunnableNoLock();
+	bool OSSchedulerForceDefaultThreadsUnsuspendedNoLock();
+	bool OSSchedulerWakeAllWaitingThreadsNoLock();
+	bool OSSchedulerRequeueReadyThreadsNoLock();
+	void OSSchedulerKickCoresAfterStateLoadNoLock();
 
 	// internal
 	void __OSAddReadyThreadToRunQueue(OSThread_t* thread);
@@ -627,3 +650,4 @@ extern MPTR activeThread[256];
 extern sint32 activeThreadCount;
 
 extern SlimRWLock srwlock_activeThreadList;
+
