@@ -1,8 +1,11 @@
 #include "wxgui/input/HotkeySettings.h"
+#include "Cafe/HW/Latte/Core/LatteOverlay.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
+#include "Cafe/OS/libs/snd_core/ax.h"
 #include "interface/WindowSystem.h"
 #include <config/ActiveSettings.h>
 #include "input/InputManager.h"
+#include "input/TAS/TASInput.h"
 #include "HotkeySettings.h"
 #include "MainWindow.h"
 
@@ -117,6 +120,16 @@ extern WindowSystem::WindowInfo g_window_info;
 
 std::unordered_map<sHotkeyCfg*, std::function<void(void)>> HotkeySettings::s_cfgHotkeyToFuncMap;
 
+namespace
+{
+	void PushMovieRecordPolicyNotification(bool readWrite)
+	{
+		LatteOverlay_pushNotification(
+			fmt::format("Movie Timeline mode: {}", readWrite ? "Read+Write (rerecord)" : "Read-only"),
+			2000);
+	}
+}
+
 struct HotkeyEntry
 {
 	std::unique_ptr<wxStaticText> name;
@@ -132,8 +145,8 @@ struct HotkeyEntry
 	}
 };
 
-HotkeySettings::HotkeySettings(wxWindow* parent)
-	: wxFrame(parent, wxID_ANY, _("Hotkey Settings"))
+HotkeySettings::HotkeySettings(wxWindow* parent, Scope scope)
+	: wxFrame(parent, wxID_ANY, scope == Scope::TasOnly ? _("TAS Hotkeys") : _("Hotkey Settings"))
 {
 	SetIcon(wxICON(X_HOTKEY_SETTINGS));
 
@@ -141,8 +154,13 @@ HotkeySettings::HotkeySettings(wxWindow* parent)
 	m_sizer->AddGrowableCol(1);
 	m_sizer->AddGrowableCol(2);
 
-	m_panel = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_THEME);
+	m_panel = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxBORDER_THEME);
+	m_panel->SetScrollRate(8, 16);
 	m_panel->SetSizer(m_sizer);
+	auto* frameSizer = new wxBoxSizer(wxVERTICAL);
+	frameSizer->Add(m_panel, 1, wxEXPAND);
+	SetSizer(frameSizer);
+	Bind(wxEVT_CLOSE_WINDOW, &HotkeySettings::OnClose, this);
 
 	Center();
 
@@ -150,23 +168,37 @@ HotkeySettings::HotkeySettings(wxWindow* parent)
 
 	CreateColumnHeaders();
 
-	/* global modifier */
-	CreateHotkeyRow(_tr("Hotkey modifier"), s_cfgHotkeys.modifiers);
-	m_hotkeys.at(0).keyInput->Hide();
+	if (scope == Scope::TasOnly)
+	{
+		CreateHotkeyRow(_tr("Frame advance pause"), s_cfgHotkeys.frameAdvancePause);
+		CreateHotkeyRow(_tr("Frame advance step"), s_cfgHotkeys.frameAdvanceStep);
+		CreateHotkeyRow(_tr("Toggle movie Timeline mode"), s_cfgHotkeys.toggleMovieRecordPolicy);
+		SetSize(920, 560);
+	}
+	else
+	{
+		/* global modifier */
+		CreateHotkeyRow(_tr("Hotkey modifier"), s_cfgHotkeys.modifiers);
+		m_hotkeys.at(0).keyInput->Hide();
 
-	/* hotkeys */
-	CreateHotkeyRow(_tr("Toggle fullscreen"), s_cfgHotkeys.toggleFullscreen);
-	CreateHotkeyRow(_tr("Take screenshot"), s_cfgHotkeys.takeScreenshot);
-	CreateHotkeyRow(_tr("Toggle fast-forward"), s_cfgHotkeys.toggleFastForward);
+		/* hotkeys */
+		CreateHotkeyRow(_tr("Toggle fullscreen"), s_cfgHotkeys.toggleFullscreen);
+		CreateHotkeyRow(_tr("Take screenshot"), s_cfgHotkeys.takeScreenshot);
+		CreateHotkeyRow(_tr("Toggle fast-forward"), s_cfgHotkeys.toggleFastForward);
+		CreateHotkeyRow(_tr("Frame advance pause"), s_cfgHotkeys.frameAdvancePause);
+		CreateHotkeyRow(_tr("Frame advance step"), s_cfgHotkeys.frameAdvanceStep);
+		CreateHotkeyRow(_tr("Toggle movie Timeline mode"), s_cfgHotkeys.toggleMovieRecordPolicy);
 #ifdef CEMU_DEBUG_ASSERT
-	CreateHotkeyRow(_tr("End emulation"), s_cfgHotkeys.endEmulation);
+		CreateHotkeyRow(_tr("End emulation"), s_cfgHotkeys.endEmulation);
 #endif
-	CreateHotkeyRow(_tr("Exit application"), s_cfgHotkeys.exitApplication);
+		CreateHotkeyRow(_tr("Exit application"), s_cfgHotkeys.exitApplication);
+		SetSize(920, 700);
+	}
 
 	m_controllerTimer = new wxTimer(this);
 	Bind(wxEVT_TIMER, &HotkeySettings::OnControllerTimer, this);
 
-	m_sizer->SetSizeHints(this);
+	m_panel->FitInside();
 }
 
 HotkeySettings::~HotkeySettings()
@@ -196,6 +228,32 @@ void HotkeySettings::Init(MainWindow* mainWindowFrame)
 		 }},
 		{&s_cfgHotkeys.toggleFastForward, [](void) {
 			 ActiveSettings::SetTimerShiftFactor((ActiveSettings::GetTimerShiftFactor() < 3) ? 3 : 1);
+		 }},
+		{&s_cfgHotkeys.frameAdvancePause, [](void) {
+			 const bool paused = TasInput::ToggleFrameAdvancePaused();
+			 snd_core::AXOut_updateDevicePlayState(!paused);
+		 }},
+		{&s_cfgHotkeys.frameAdvanceStep, [](void) {
+			 if (!TasInput::IsFrameAdvancePaused())
+			 {
+				 TasInput::SetFrameAdvancePaused(true);
+				 snd_core::AXOut_updateDevicePlayState(false);
+			 }
+			 TasInput::RequestFrameAdvanceStep(1);
+		 }},
+		{&s_cfgHotkeys.toggleMovieRecordPolicy, [](void) {
+			 auto& cfg = GetWxGUIConfig();
+			 const uint32 current = std::clamp<uint32>(cfg.tas.movie_record_policy, 0, 1);
+			 const uint32 next = (current == 0) ? 1u : 0u;
+			 cfg.tas.movie_record_policy = next;
+			 if (next == 1u)
+			 {
+				 // Entering rerecord policy should immediately return to record mode.
+				 cfg.tas.movie_mode = 2u;
+			 }
+			 GetConfigHandle().Save();
+			 TasInput::ReloadFromConfig();
+			 PushMovieRecordPolicyNotification(next == 1);
 		 }},
 		{&s_cfgHotkeys.exitApplication, [](void) {
 			auto closeEvent = new wxCloseEvent{wxEVT_CLOSE_WINDOW, s_mainWindow->GetId()};
@@ -309,6 +367,23 @@ void HotkeySettings::OnControllerTimer(wxTimerEvent& event)
 			return;
 		}
 	}
+}
+
+void HotkeySettings::OnClose(wxCloseEvent& event)
+{
+	if (m_activeInputButton)
+	{
+		if (m_controllerTimer->IsRunning())
+			RestoreInputButton<ControllerHotkey_t>();
+		else
+			RestoreInputButton<uKeyboardHotkey>();
+	}
+
+	if (m_controllerTimer->IsRunning())
+		m_controllerTimer->Stop();
+
+	Destroy();
+	event.Skip(false);
 }
 
 void HotkeySettings::OnKeyboardHotkeyInputLeftClick(wxCommandEvent& event)
@@ -490,7 +565,7 @@ wxString HotkeySettings::To_wxString(ControllerHotkey_t hotkey)
 	return m_activeController.lock()->get_button_name(hotkey);
 }
 
-void HotkeySettings::CaptureInput(wxKeyEvent& event)
+bool HotkeySettings::CaptureInput(wxKeyEvent& event)
 {
 	uKeyboardHotkey hotkey{};
 	hotkey.key = event.GetKeyCode();
@@ -499,7 +574,11 @@ void HotkeySettings::CaptureInput(wxKeyEvent& event)
 	hotkey.shift = event.ShiftDown();
 	const auto it = s_keyboardHotkeyToFuncMap.find(hotkey.raw);
 	if (it != s_keyboardHotkeyToFuncMap.end())
+	{
 		it->second();
+		return true;
+	}
+	return false;
 }
 
 void HotkeySettings::CaptureInput(const ControllerState& currentState, const ControllerState& lastState)
@@ -520,3 +599,7 @@ void HotkeySettings::CaptureInput(const ControllerState& currentState, const Con
 		}
 	}
 }
+
+
+
+
