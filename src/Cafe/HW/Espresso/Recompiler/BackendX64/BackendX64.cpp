@@ -122,7 +122,7 @@ void PPCRecompilerX64Gen_rememberRelocatableOffset(x64GenContext_t* x64GenContex
 	x64GenContext->relocateOffsetTable2.emplace_back(x64GenContext->emitter->GetWriteIndex(), extraInfo);
 }
 
-void PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext_t* x64GenContext, sint32 jumpInstructionOffset, sint32 destinationOffset)
+bool PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext_t* x64GenContext, sint32 jumpInstructionOffset, sint32 destinationOffset)
 {
 	uint8* instructionData = x64GenContext->emitter->GetBufferPtr() + jumpInstructionOffset;
 	if (instructionData[0] == 0x0F && (instructionData[1] >= 0x80 && instructionData[1] <= 0x8F))
@@ -149,8 +149,11 @@ void PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext_t* x64GenContext, si
 	}
 	else
 	{
-		assert_dbg();
+		cemuLog_log(LogType::Force, "PPCRecompilerX64Gen_redirectRelativeJump: unexpected opcode=0x{:02x} at jumpOffset=0x{:x} destOffset=0x{:x}; rejecting block",
+			instructionData[0], jumpInstructionOffset, destinationOffset);
+		return false;
 	}
+	return true;
 }
 
 void* ATTR_MS_ABI PPCRecompiler_virtualHLE(PPCInterpreter_t* hCPU, uint32 hleFuncId)
@@ -166,8 +169,16 @@ void* ATTR_MS_ABI PPCRecompiler_virtualHLE(PPCInterpreter_t* hCPU, uint32 hleFun
 	else
 	{
 		auto hleCall = PPCInterpreter_getHLECall(hleFuncId);
-		cemu_assert(hleCall != nullptr);
-		hleCall(hCPU);
+		if (!hleCall)
+		{
+			cemuLog_log(LogType::Force, "Recompiler virtualHLE missing handler id=0x{:04x} ip=0x{:08x} lr=0x{:08x}; falling back to next instruction",
+				hleFuncId, hCPU->instructionPointer, hCPU->spr.LR);
+			PPCInterpreter_nextInstruction(hCPU);
+		}
+		else
+		{
+			hleCall(hCPU);
+		}
 	}
 	hCPU->rspTemp = prevRSPTemp;
 	return PPCInterpreter_getCurrentInstance();
@@ -305,7 +316,8 @@ bool PPCRecompilerX64Gen_imlInstruction_macro(PPCRecFunction_t* PPCRecFunction, 
 		x64Gen_add_reg64_reg64(x64GenContext, X86_REG_RAX, REG_RESV_RECDATA);
 		// JMP [recompilerCallTable+EAX/4*8]
 		x64Gen_jmp_memReg64(x64GenContext, X86_REG_RAX, (uint32)offsetof(PPCRecompilerInstanceData_t, ppcRecompilerDirectJumpTable));
-		PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset1, x64GenContext->emitter->GetWriteIndex());
+		if (!PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset1, x64GenContext->emitter->GetWriteIndex()))
+			return false;
 		// check if instruction pointer was changed
 		// assign new instruction pointer to EAX
 		x64Emit_mov_reg64_mem32(x64GenContext, X86_REG_RAX, REG_RESV_HCPU, offsetof(PPCInterpreter_t, instructionPointer));
@@ -598,9 +610,11 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r(PPCRecFunction_t* PPCRecFunction, pp
 			x64Gen_add_reg64Low32_imm32(x64GenContext, regR, 32-1);
 			sint32 jumpInstructionOffset2 = x64GenContext->emitter->GetWriteIndex();
 			x64Gen_jmpc_near(x64GenContext, X86_CONDITION_NONE, 0);
-			PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset1, x64GenContext->emitter->GetWriteIndex());
+			if (!PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset1, x64GenContext->emitter->GetWriteIndex()))
+				return false;
 			x64Gen_mov_reg64Low32_imm32(x64GenContext, regR, 32);
-			PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset2, x64GenContext->emitter->GetWriteIndex());
+			if (!PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset2, x64GenContext->emitter->GetWriteIndex()))
+				return false;
 		}
 	}
 	else if( imlInstruction->operation == PPCREC_IML_OP_X86_CMP)
@@ -758,7 +772,8 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction, 
 					else
 						x64Gen_shr_reg64Low32_imm8(x64GenContext, REG_RESV_TEMP, (1 << b));
 				}
-				PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset, x64GenContext->emitter->GetWriteIndex());
+				if (!PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset, x64GenContext->emitter->GetWriteIndex()))
+					return false;
 			}
 			x64Gen_mov_reg64_reg64(x64GenContext, rRegResult, REG_RESV_TEMP);
 		}
@@ -790,7 +805,8 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction, 
 				sint32 jumpInstructionOffset = x64GenContext->emitter->GetWriteIndex();
 				x64Gen_jmpc_near(x64GenContext, X86_CONDITION_EQUAL, 0); // jump if bit not set
 				x64Gen_rol_reg64Low32_imm8(x64GenContext, REG_RESV_TEMP, (1<<b));
-				PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset, x64GenContext->emitter->GetWriteIndex());
+				if (!PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext, jumpInstructionOffset, x64GenContext->emitter->GetWriteIndex()))
+					return false;
 			}
 			x64Gen_mov_reg64_reg64(x64GenContext, rRegResult, REG_RESV_TEMP);
 		}
@@ -1493,7 +1509,8 @@ bool PPCRecompiler_generateX64Code(PPCRecFunction_t* PPCRecFunction, ppcImlGenCo
 			}
 			else if( imlInstruction->type == PPCREC_IML_TYPE_FPR_R_R_R_R )
 			{
-				PPCRecompilerX64Gen_imlInstruction_fpr_r_r_r_r(PPCRecFunction, ppcImlGenContext, &x64GenContext, imlInstruction);		
+				if (!PPCRecompilerX64Gen_imlInstruction_fpr_r_r_r_r(PPCRecFunction, ppcImlGenContext, &x64GenContext, imlInstruction))
+					codeGenerationFailed = true;
 			}
 			else if( imlInstruction->type == PPCREC_IML_TYPE_FPR_R )
 			{
@@ -1669,4 +1686,5 @@ void PPCRecompilerX64Gen_generateRecompilerInterfaceFunctions()
 	PPCRecompiler_leaveRecompilerCode_visited = (void ATTR_MS_ABI (*)())PPCRecompilerX64Gen_generateLeaveRecompilerCode();
 	cemu_assert_debug(PPCRecompiler_leaveRecompilerCode_unvisited != PPCRecompiler_leaveRecompilerCode_visited);
 }
+
 
