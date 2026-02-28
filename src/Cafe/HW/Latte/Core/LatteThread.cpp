@@ -23,6 +23,10 @@ LatteGPUState_t LatteGPUState = {};
 
 std::atomic_bool sLatteThreadRunning = false;
 std::atomic_bool sLatteThreadFinishedInit = false;
+std::atomic_bool g_lattePauseRequested = false;
+std::atomic_bool g_lattePaused = false;
+std::atomic_uint64_t g_lattePausedPresentRequest{0};
+std::atomic_uint64_t g_lattePausedPresentCompleted{0};
 
 void LatteThread_Exit();
 
@@ -236,6 +240,8 @@ void Latte_Stop()
 	std::unique_lock _lock(sLatteThreadStateMutex);
 	if (!sLatteThreadRunning)
 		return;
+	g_lattePauseRequested = false;
+	g_lattePaused = false;
 	sLatteThreadRunning = false;
 	_lock.unlock();
 	sLatteThread.join();
@@ -244,6 +250,50 @@ void Latte_Stop()
 bool Latte_GetStopSignal()
 {
 	return !sLatteThreadRunning;
+}
+
+void Latte_RequestPause(bool pause)
+{
+	g_lattePauseRequested.store(pause, std::memory_order_release);
+	if (!pause)
+		g_lattePaused.store(false, std::memory_order_release);
+}
+
+bool Latte_WaitUntilPaused(uint32 timeoutMs)
+{
+	const auto start = std::chrono::steady_clock::now();
+	while (true)
+	{
+		if (!sLatteThreadRunning.load(std::memory_order_acquire))
+			return false;
+		if (g_lattePaused.load(std::memory_order_acquire))
+			return true;
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		if (elapsed >= timeoutMs)
+			return false;
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+}
+
+uint64 Latte_RequestPausedPresentOnce()
+{
+	return g_lattePausedPresentRequest.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+bool Latte_WaitForPausedPresent(uint64 requestId, uint32 timeoutMs)
+{
+	const auto start = std::chrono::steady_clock::now();
+	while (true)
+	{
+		if (!sLatteThreadRunning.load(std::memory_order_acquire))
+			return false;
+		if (g_lattePausedPresentCompleted.load(std::memory_order_acquire) >= requestId)
+			return true;
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		if (elapsed >= timeoutMs)
+			return false;
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
 }
 
 void LatteThread_Exit()
@@ -268,6 +318,8 @@ void LatteThread_Exit()
 	}
 	// reset GPU7 state
 	std::memset(&LatteGPUState, 0, sizeof(LatteGPUState));
+	g_lattePauseRequested = false;
+	g_lattePaused = false;
 	#if BOOST_OS_WINDOWS
 	ExitThread(0);
 	#else
@@ -275,3 +327,4 @@ void LatteThread_Exit()
 	#endif
 	cemu_assert_unimplemented();
 }
+
