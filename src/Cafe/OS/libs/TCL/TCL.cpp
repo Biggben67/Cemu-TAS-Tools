@@ -68,6 +68,21 @@ namespace TCL
 	std::atomic<uint32> tclRingBufferA_readIndex{0};
 	std::atomic<uint32> tclRingBufferA_writeIndex{0};
 
+	void TCLResetAfterTimelineLoad()
+	{
+		const uint32 writeIndex = tclRingBufferA_writeIndex.load(std::memory_order::acquire);
+		const uint32 readIndex = tclRingBufferA_readIndex.load(std::memory_order::acquire);
+		const uint32 pendingWords = (writeIndex + TCL_RING_BUFFER_SIZE - readIndex) & (TCL_RING_BUFFER_SIZE - 1);
+		tclRingBufferA_readIndex.store(writeIndex, std::memory_order::release);
+
+		stdx::atomic_ref<uint64be> retireTimestamp(s_tclStatePPC->gpuRetireMarker);
+		const uint64 retiredMarker = retireTimestamp.load();
+		s_currentRetireMarker = retiredMarker;
+
+		cemuLog_log(LogType::Force, "Timeline TCL reset: droppedPendingWords={} readIndex={} writeIndex={} retireMarker={}",
+			pendingWords, readIndex, writeIndex, retiredMarker);
+	}
+
 	// GPU code calls this to grab the next command word
 	bool TCLGPUReadRBWord(uint32& cmdWord)
 	{
@@ -192,3 +207,4 @@ namespace TCL
 		return &s_COStclModule;
 	}
 }
+
