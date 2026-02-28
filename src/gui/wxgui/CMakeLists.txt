@@ -98,6 +98,8 @@ add_library(CemuWxGui STATIC
   MemorySearcherTool.h
   PadViewFrame.cpp
   PadViewFrame.h
+  TasInputWindow.cpp
+  TasInputWindow.h
   TitleManager.cpp
   TitleManager.h
   wxCemuConfig.cpp
@@ -179,3 +181,4 @@ endif()
 if(ALLOW_PORTABLE)
 	target_compile_definitions(CemuWxGui PRIVATE CEMU_ALLOW_PORTABLE)
 endif ()
+
