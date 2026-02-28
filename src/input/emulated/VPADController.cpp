@@ -5,6 +5,7 @@
 #include "input/InputManager.h"
 #include "Cafe/HW/Latte/Core/Latte.h"
 #include "Cafe/CafeSystem.h"
+#include "input/TAS/TASInput.h"
 
 enum ControllerVPADMapping2 : uint32
 {
@@ -44,8 +45,145 @@ enum ControllerVPADMapping2 : uint32
 	VPAD_REPEAT = 0x80000000,
 };
 
+static uint32 TasButtonsToVpadHold(const TasInput::VPADMovieSample& sample)
+{
+	uint32 hold = 0;
+	const auto btn = [&](uint32 mask) { return (sample.buttons & mask) != 0; };
+	if (btn(TasInput::kBtnA)) hold |= VPAD_A;
+	if (btn(TasInput::kBtnB)) hold |= VPAD_B;
+	if (btn(TasInput::kBtnX)) hold |= VPAD_X;
+	if (btn(TasInput::kBtnY)) hold |= VPAD_Y;
+	if (btn(TasInput::kBtnL)) hold |= VPAD_L;
+	if (btn(TasInput::kBtnR)) hold |= VPAD_R;
+	if (btn(TasInput::kBtnZL)) hold |= VPAD_ZL;
+	if (btn(TasInput::kBtnZR)) hold |= VPAD_ZR;
+	if (btn(TasInput::kBtnPlus)) hold |= VPAD_PLUS;
+	if (btn(TasInput::kBtnMinus)) hold |= VPAD_MINUS;
+	if (btn(TasInput::kBtnHome)) hold |= VPAD_HOME;
+	if (btn(TasInput::kBtnUp)) hold |= VPAD_UP;
+	if (btn(TasInput::kBtnDown)) hold |= VPAD_DOWN;
+	if (btn(TasInput::kBtnLeft)) hold |= VPAD_LEFT;
+	if (btn(TasInput::kBtnRight)) hold |= VPAD_RIGHT;
+	if (btn(TasInput::kBtnStickL)) hold |= VPAD_STICK_L;
+	if (btn(TasInput::kBtnStickR)) hold |= VPAD_STICK_R;
+	if (sample.lx <= -0.5f) hold |= VPAD_STICK_L_LEFT;
+	else if (sample.lx >= 0.5f) hold |= VPAD_STICK_L_RIGHT;
+	if (sample.ly <= -0.5f) hold |= VPAD_STICK_L_DOWN;
+	else if (sample.ly >= 0.5f) hold |= VPAD_STICK_L_UP;
+	if (sample.rx <= -0.5f) hold |= VPAD_STICK_R_LEFT;
+	else if (sample.rx >= 0.5f) hold |= VPAD_STICK_R_RIGHT;
+	if (sample.ry <= -0.5f) hold |= VPAD_STICK_R_DOWN;
+	else if (sample.ry >= 0.5f) hold |= VPAD_STICK_R_UP;
+	return hold;
+}
+
+static TasInput::VPADMovieSample VpadStatusToTasSample(const VPADStatus_t& status)
+{
+	TasInput::VPADMovieSample sample{};
+	sample.lx = std::clamp((float)status.leftStick.x, -1.0f, 1.0f);
+	sample.ly = std::clamp((float)status.leftStick.y, -1.0f, 1.0f);
+	sample.rx = std::clamp((float)status.rightStick.x, -1.0f, 1.0f);
+	sample.ry = std::clamp((float)status.rightStick.y, -1.0f, 1.0f);
+	sample.vpadHold = (uint32)status.hold;
+	sample.hasVpadHold = true;
+	sample.zl = (status.hold & VPAD_ZL) ? 1.0f : 0.0f;
+	sample.zr = (status.hold & VPAD_ZR) ? 1.0f : 0.0f;
+	if (status.hold & VPAD_A) sample.buttons |= TasInput::kBtnA;
+	if (status.hold & VPAD_B) sample.buttons |= TasInput::kBtnB;
+	if (status.hold & VPAD_X) sample.buttons |= TasInput::kBtnX;
+	if (status.hold & VPAD_Y) sample.buttons |= TasInput::kBtnY;
+	if (status.hold & VPAD_L) sample.buttons |= TasInput::kBtnL;
+	if (status.hold & VPAD_R) sample.buttons |= TasInput::kBtnR;
+	if (status.hold & VPAD_ZL) sample.buttons |= TasInput::kBtnZL;
+	if (status.hold & VPAD_ZR) sample.buttons |= TasInput::kBtnZR;
+	if (status.hold & VPAD_PLUS) sample.buttons |= TasInput::kBtnPlus;
+	if (status.hold & VPAD_MINUS) sample.buttons |= TasInput::kBtnMinus;
+	if (status.hold & VPAD_HOME) sample.buttons |= TasInput::kBtnHome;
+	if (status.hold & VPAD_UP) sample.buttons |= TasInput::kBtnUp;
+	if (status.hold & VPAD_DOWN) sample.buttons |= TasInput::kBtnDown;
+	if (status.hold & VPAD_LEFT) sample.buttons |= TasInput::kBtnLeft;
+	if (status.hold & VPAD_RIGHT) sample.buttons |= TasInput::kBtnRight;
+	if (status.hold & VPAD_STICK_L) sample.buttons |= TasInput::kBtnStickL;
+	if (status.hold & VPAD_STICK_R) sample.buttons |= TasInput::kBtnStickR;
+	return sample;
+}
+
 void VPADController::VPADRead(VPADStatus_t& status, const BtnRepeat& repeat)
 {
+	if (TasInput::IsFrameAdvancePaused() && m_hasCachedStatus && m_cachedFrameCounter == LatteGPUState.frameCounter)
+	{
+		status = m_cachedStatus;
+		return;
+	}
+	status = {};
+
+	// Poll timing should only consume when we actually refresh a VPAD sample.
+	TasInput::BeginVPADPoll(m_player_index, LatteGPUState.frameCounter);
+	const bool moviePlaybackActive = TasInput::GetMovieMode() == TasInput::MovieMode::Playback;
+	const uint32 last_hold = m_last_holdvalue;
+	if (moviePlaybackActive)
+	{
+		TasInput::VPADMovieSample moviePlaybackSample{};
+		const bool hasMoviePlaybackSample =
+			TasInput::TryGetVPADPlaybackSample(m_player_index, LatteGPUState.frameCounter, moviePlaybackSample);
+
+		if (hasMoviePlaybackSample)
+		{
+			status.leftStick.x = moviePlaybackSample.lx;
+			status.leftStick.y = moviePlaybackSample.ly;
+			status.rightStick.x = moviePlaybackSample.rx;
+			status.rightStick.y = moviePlaybackSample.ry;
+			// Always include canonical TAS button mapping.
+			// Some imported movies contain incomplete vpadHold masks.
+			status.hold = TasButtonsToVpadHold(moviePlaybackSample);
+			if (moviePlaybackSample.hasVpadHold)
+				status.hold |= moviePlaybackSample.vpadHold;
+		}
+		else
+		{
+			status.leftStick = {0.0f, 0.0f};
+			status.rightStick = {0.0f, 0.0f};
+			status.hold = 0;
+		}
+
+		status.release = last_hold & ~status.hold;
+		status.trig = ~last_hold & status.hold;
+		m_last_holdvalue = status.hold;
+		if (status.hold != last_hold)
+		{
+			const uint64 nowFrame = static_cast<uint64>(LatteGPUState.frameCounter);
+			m_last_hold_change_frame = nowFrame;
+			m_last_pulse_frame = nowFrame;
+		}
+
+		m_mic_active = false;
+		m_screen_active = false;
+		m_homebutton_down |= (status.hold & VPAD_HOME) != 0;
+
+		status.tpData.touch = kTpTouchOff;
+		status.tpData.validity = kTpInvalid;
+		status.tpData.x = (uint16)m_last_touch_position.x;
+		status.tpData.y = (uint16)m_last_touch_position.y;
+		status.tpProcessed1 = status.tpData;
+		status.tpProcessed2 = status.tpData;
+
+		status.dir.x = {1, 0, 0};
+		status.dir.y = {0, 1, 0};
+		status.dir.z = {0, 0, 1};
+		status.acc = {0.0f, 0.0f, 0.0f};
+		status.accMagnitude = 0.0f;
+		status.accAcceleration = 0.0f;
+		status.accXY = {1.0f, 0.0f};
+		status.gyroChange = {0.0f, 0.0f, 0.0f};
+		status.gyroOrientation = {0.0f, 0.0f, 0.0f};
+		status.magnet = {0.0f, 0.0f, 0.0f};
+
+		m_cachedStatus = status;
+		m_cachedFrameCounter = LatteGPUState.frameCounter;
+		m_hasCachedStatus = true;
+		return;
+	}
+
 	controllers_update_states();
 	m_mic_active = false;
 	m_screen_active = false;
@@ -81,8 +219,6 @@ void VPADController::VPADRead(VPADStatus_t& status, const BtnRepeat& repeat)
 
 	constexpr float kAxisThreshold = 0.5f;
 	constexpr float kHoldAxisThreshold = 0.1f;
-	const uint32 last_hold = m_last_holdvalue;
-
 	if (axis.x <= -kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_LEFT) && axis.x <= -kHoldAxisThreshold))
 		status.hold |= VPAD_STICK_L_LEFT;
 	else if (axis.x >= kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_RIGHT) && axis.x >= kHoldAxisThreshold))
@@ -109,27 +245,31 @@ void VPADController::VPADRead(VPADStatus_t& status, const BtnRepeat& repeat)
 		status.hold |= VPAD_STICK_R_UP;
 
 	// button repeat
-	const auto now = std::chrono::high_resolution_clock::now();
+	// Use frame-based repeat timing to avoid wall-clock nondeterminism during TAS/movie playback.
+	const uint64 nowFrame = static_cast<uint64>(LatteGPUState.frameCounter);
 	if (status.hold != m_last_holdvalue)
 	{
-		m_last_hold_change = m_last_pulse = now;
+		m_last_hold_change_frame = nowFrame;
+		m_last_pulse_frame = nowFrame;
 	}
 
 	if (repeat.pulse > 0)
 	{
-		if (m_last_hold_change + std::chrono::milliseconds(repeat.delay) >= now)
+		const uint64 delayFrames = std::max<uint64>(1, (static_cast<uint64>(repeat.delay) * 60ull + 999ull) / 1000ull);
+		const uint64 pulseFrames = std::max<uint64>(1, (static_cast<uint64>(repeat.pulse) * 60ull + 999ull) / 1000ull);
+		if (nowFrame >= (m_last_hold_change_frame + delayFrames))
 		{
-			if ((m_last_pulse + std::chrono::milliseconds(repeat.pulse)) < now)
+			if (nowFrame >= (m_last_pulse_frame + pulseFrames))
 			{
-				m_last_pulse = now;
+				m_last_pulse_frame = nowFrame;
 				status.hold |= VPAD_REPEAT;
 			}
 		}
 	}
 
 	// general
-	status.release = m_last_holdvalue & ~status.hold;
-	status.trig = ~m_last_holdvalue & status.hold;
+	status.release = last_hold & ~status.hold;
+	status.trig = ~last_hold & status.hold;
 	m_last_holdvalue = status.hold;
 
 	// touch
@@ -141,6 +281,17 @@ void VPADController::VPADRead(VPADStatus_t& status, const BtnRepeat& repeat)
 	status.dir.z = {0, 0, 1};
 	status.accXY = {1.0f, 0.0f};
 	update_motion(status);
+	const auto recordedSample = VpadStatusToTasSample(status);
+	TasInput::RecordVPADSample(m_player_index, LatteGPUState.frameCounter, recordedSample);
+
+	m_cachedStatus = status;
+	m_cachedFrameCounter = LatteGPUState.frameCounter;
+	m_hasCachedStatus = true;
+}
+
+void VPADController::InvalidateCachedReadState()
+{
+	m_hasCachedStatus = false;
 }
 
 void VPADController::update()
@@ -481,6 +632,8 @@ glm::vec2 VPADController::get_axis() const
 	glm::vec2 result;
 	result.x = (left > right) ? -left : right;
 	result.y = (up > down) ? up : -down;
+	if (TasInput::IsManualInputEnabled() || TasInput::IsMovieActive())
+		return { std::clamp(result.x, -1.0f, 1.0f), std::clamp(result.y, -1.0f, 1.0f) };
 	return length(result) > 1.0f ? normalize(result) : result;
 }
 
@@ -495,6 +648,8 @@ glm::vec2 VPADController::get_rotation() const
 	glm::vec2 result;
 	result.x = (left > right) ? -left : right;
 	result.y = (up > down) ? up : -down;
+	if (TasInput::IsManualInputEnabled() || TasInput::IsMovieActive())
+		return { std::clamp(result.x, -1.0f, 1.0f), std::clamp(result.y, -1.0f, 1.0f) };
 	return length(result) > 1.0f ? normalize(result) : result;
 }
 
@@ -696,3 +851,4 @@ void VPADController::save(pugi::xml_node& node)
 {
 	node.append_child("toggle_display").append_child(pugi::node_pcdata).set_value(fmt::format("{}", (int)m_screen_active_toggle).c_str());
 }
+
