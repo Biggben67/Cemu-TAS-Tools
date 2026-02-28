@@ -35,6 +35,7 @@
 
 #include "wxgui/TitleManager.h"
 #include "wxgui/EmulatedUSBDevices/EmulatedUSBDeviceFrame.h"
+#include "wxgui/TasInputWindow.h"
 
 #include "Cafe/CafeSystem.h"
 
@@ -46,6 +47,9 @@
 #include "wxgui/input/InputSettings2.h"
 #include "wxgui/input/HotkeySettings.h"
 #include "input/InputManager.h"
+#include "input/TAS/TASInput.h"
+#include <wx/filedlg.h>
+#include <wx/spinctrl.h>
 
 #if BOOST_OS_WINDOWS
 #define exit(__c) ExitProcess(__c)
@@ -125,6 +129,9 @@ enum
 	MAINFRAME_MENU_ID_TOOLS_TITLE_MANAGER,
 	MAINFRAME_MENU_ID_TOOLS_DOWNLOAD_MANAGER,
 	MAINFRAME_MENU_ID_TOOLS_EMULATED_USB_DEVICES,
+	MAINFRAME_MENU_ID_TOOLS_TAS_TOOLS,
+	MAINFRAME_MENU_ID_TOOLS_TAS_INPUT_EDITOR,
+	MAINFRAME_MENU_ID_TOOLS_TAS_HOTKEYS,
 	// cpu
 	// cpu->timer speed
 	MAINFRAME_MENU_ID_TIMER_SPEED_1X = 20700,
@@ -209,6 +216,9 @@ EVT_MENU(MAINFRAME_MENU_ID_TOOLS_MEMORY_SEARCHER, MainWindow::OnToolsInput)
 EVT_MENU(MAINFRAME_MENU_ID_TOOLS_TITLE_MANAGER, MainWindow::OnToolsInput)
 EVT_MENU(MAINFRAME_MENU_ID_TOOLS_DOWNLOAD_MANAGER, MainWindow::OnToolsInput)
 EVT_MENU(MAINFRAME_MENU_ID_TOOLS_EMULATED_USB_DEVICES, MainWindow::OnToolsInput)
+EVT_MENU(MAINFRAME_MENU_ID_TOOLS_TAS_TOOLS, MainWindow::OnToolsInput)
+EVT_MENU(MAINFRAME_MENU_ID_TOOLS_TAS_INPUT_EDITOR, MainWindow::OnToolsInput)
+EVT_MENU(MAINFRAME_MENU_ID_TOOLS_TAS_HOTKEYS, MainWindow::OnToolsInput)
 // cpu menu
 EVT_MENU(MAINFRAME_MENU_ID_TIMER_SPEED_8X, MainWindow::OnDebugSetting)
 EVT_MENU(MAINFRAME_MENU_ID_TIMER_SPEED_4X, MainWindow::OnDebugSetting)
@@ -303,6 +313,157 @@ private:
 	MainWindow* m_window;
 };
 
+class TasToolsWindow : public wxFrame
+{
+public:
+	TasToolsWindow(wxWindow* parent)
+		: wxFrame(parent, wxID_ANY, _("TAS Tools"), wxDefaultPosition, wxSize(760, 380))
+	{
+		auto* panel = new wxPanel(this, wxID_ANY);
+		auto* root = new wxBoxSizer(wxVERTICAL);
+
+		m_tasMode = new wxCheckBox(panel, wxID_ANY, _("TAS Mode"));
+		m_tasMode->SetToolTip(_("Enable deterministic TAS behavior for playback/recording."));
+		root->Add(m_tasMode, 0, wxLEFT | wxRIGHT | wxTOP, 5);
+
+		root->Add(new wxStaticText(panel, wxID_ANY, _("Game source: currently selected game in the library list")), 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+		auto* actions = new wxBoxSizer(wxHORIZONTAL);
+		m_playRecording = new wxButton(panel, wxID_ANY, _("Play recording"));
+		m_startRecording = new wxButton(panel, wxID_ANY, _("Start recording"));
+		m_exportRecording = new wxButton(panel, wxID_ANY, _("Export recording"));
+		m_apply = new wxButton(panel, wxID_ANY, _("Apply"));
+		actions->Add(m_playRecording, 0, wxALL, 5);
+		actions->Add(m_startRecording, 0, wxALL, 5);
+		actions->Add(m_exportRecording, 0, wxALL, 5);
+		actions->AddStretchSpacer();
+		actions->Add(m_apply, 0, wxALL, 5);
+		root->Add(actions, 0, wxEXPAND);
+
+		panel->SetSizer(root);
+
+		m_playRecording->Bind(wxEVT_BUTTON, [this](wxCommandEvent&)
+			{
+				wxFileDialog dialog(this, _("Select movie file"), wxEmptyString, wxEmptyString,
+					_("Movie files (*.ctm;*.csv)|*.ctm;*.csv|All files (*.*)|*.*"), wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+				if (dialog.ShowModal() != wxID_OK)
+					return;
+				const fs::path moviePath = wxHelper::MakeFSPath(dialog.GetPath());
+				uint64 movieTitleId = 0;
+				std::string error;
+				if (!TasInput::ReadMovieTitleIdFromFile(moviePath, movieTitleId, error))
+				{
+					wxMessageBox(wxString::FromUTF8(error.c_str()), _("Error"), wxOK | wxCENTRE | wxICON_ERROR, this);
+					return;
+				}
+				m_tasMode->SetValue(true);
+				auto& cfg = GetWxGUIConfig().tas;
+				cfg.movie_mode = 1;
+				SaveToConfig(true);
+				if (!TasInput::ImportMovieForPlaybackFromFile(moviePath, error, true))
+				{
+					wxMessageBox(wxString::FromUTF8(error.c_str()), _("Error"), wxOK | wxCENTRE | wxICON_ERROR, this);
+					return;
+				}
+				BootSelectedLibraryGame(true, movieTitleId);
+			});
+		m_startRecording->Bind(wxEVT_BUTTON, [this](wxCommandEvent&)
+			{
+				MainWindow* mainWindow = dynamic_cast<MainWindow*>(GetParent());
+				if (!mainWindow)
+					return;
+
+				fs::path gamePath;
+				uint64 selectedTitleId = 0;
+				if (!mainWindow->GetSelectedGameListEntryForTas(gamePath, selectedTitleId) || gamePath.empty() || selectedTitleId == 0)
+				{
+					wxMessageBox(_("Select a game in the library first"), _("Error"), wxOK | wxCENTRE | wxICON_ERROR, this);
+					return;
+				}
+
+				const fs::path defaultRecordPath = ActiveSettings::GetUserDataPath(fmt::format("Timelines/title_{:016x}.ctm", selectedTitleId));
+				m_tasMode->SetValue(true);
+				TasInput::SetManualInputEnabled(true);
+				auto& cfg = GetWxGUIConfig().tas;
+				cfg.movie_mode = 2;
+				SaveToConfig(true);
+				std::string error;
+				if (!TasInput::EnsureMovieRecordTimeline(defaultRecordPath, error))
+				{
+					wxMessageBox(wxString::FromUTF8(error.c_str()), _("Error"), wxOK | wxCENTRE | wxICON_ERROR, this);
+					return;
+				}
+				BootSelectedLibraryGame(false, 0);
+			});
+		m_exportRecording->Bind(wxEVT_BUTTON, [this](wxCommandEvent&)
+			{
+				wxFileDialog dialog(this, _("Export recording"), wxEmptyString, "movie.ctm",
+					_("Cemu TAS movie (*.ctm)|*.ctm|All files (*.*)|*.*"), wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+				if (dialog.ShowModal() != wxID_OK)
+					return;
+				std::string error;
+				if (!TasInput::ExportMovieToFile(wxHelper::MakeFSPath(dialog.GetPath()), error))
+					wxMessageBox(wxString::FromUTF8(error.c_str()), _("Error"), wxOK | wxCENTRE | wxICON_ERROR, this);
+			});
+		m_apply->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { SaveToConfig(false); });
+		Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& evt) { Destroy(); evt.Skip(false); });
+
+		LoadFromConfig();
+	}
+
+private:
+	void LoadFromConfig()
+	{
+		const auto& cfg = GetWxGUIConfig().tas;
+		m_tasMode->SetValue(cfg.strict_tas_mode || cfg.deterministic_scheduler || cfg.deterministic_time);
+	}
+
+	void SaveToConfig(bool reloadTas)
+	{
+		auto& cfg = GetWxGUIConfig().tas;
+		cfg.input_playback_enabled = true;
+		cfg.input_playback_loop = false;
+		cfg.strict_tas_mode = m_tasMode->GetValue();
+		cfg.deterministic_scheduler = cfg.strict_tas_mode.GetValue();
+		cfg.deterministic_time = cfg.strict_tas_mode.GetValue();
+		cfg.input_playback_file.clear();
+		GetConfigHandle().Save();
+		if (reloadTas)
+			TasInput::ReloadFromConfig();
+	}
+
+	void BootSelectedLibraryGame(bool validateMovieTitle, uint64 expectedMovieTitleId)
+	{
+		MainWindow* mainWindow = dynamic_cast<MainWindow*>(GetParent());
+		if (!mainWindow)
+			return;
+		fs::path gamePath;
+		uint64 selectedTitleId = 0;
+		if (!mainWindow->GetSelectedGameListEntryForTas(gamePath, selectedTitleId) || gamePath.empty() || selectedTitleId == 0)
+		{
+			wxMessageBox(_("Select a game in the library first"), _("Error"), wxOK | wxCENTRE | wxICON_ERROR, this);
+			return;
+		}
+
+		if (validateMovieTitle)
+		{
+			if (expectedMovieTitleId != 0 && expectedMovieTitleId != selectedTitleId)
+			{
+				wxMessageBox(_("Selected game does not match the recording's title ID"), _("Error"), wxOK | wxCENTRE | wxICON_ERROR, this);
+				return;
+			}
+		}
+
+		mainWindow->FileLoad(gamePath, wxLaunchGameEvent::INITIATED_BY::MENU);
+	}
+
+	wxCheckBox* m_tasMode{};
+	wxButton* m_playRecording{};
+	wxButton* m_startRecording{};
+	wxButton* m_exportRecording{};
+	wxButton* m_apply{};
+};
+
 MainWindow::MainWindow()
 	: wxFrame(nullptr, wxID_ANY, GetInitialWindowTitle(), wxDefaultPosition, wxSize(1280, 720), wxMINIMIZE_BOX | wxMAXIMIZE_BOX | wxSYSTEM_MENU | wxCAPTION | wxCLOSE_BOX | wxCLIP_CHILDREN | wxRESIZE_BORDER)
 {
@@ -390,6 +551,18 @@ MainWindow::MainWindow()
 
 MainWindow::~MainWindow()
 {
+	if (m_tas_tools_window)
+	{
+		m_tas_tools_window->Destroy();
+		m_tas_tools_window = nullptr;
+	}
+
+	if (m_tas_input_window)
+	{
+		m_tas_input_window->Destroy();
+		m_tas_input_window = nullptr;
+	}
+
 	if (m_padView)
 	{
 		m_padView->Destroy();
@@ -491,6 +664,31 @@ bool MainWindow::InstallUpdate(const fs::path& metaFilePath)
 		wxMessageBox(ex.what(), _("Update error"));
 	}
 	return false;
+}
+
+bool MainWindow::GetSelectedGameListEntryForTas(fs::path& outPath, uint64& outTitleId) const
+{
+	outPath.clear();
+	outTitleId = 0;
+	if (!m_game_list)
+		return false;
+	const long selection = m_game_list->GetFirstSelected();
+	if (selection == wxNOT_FOUND)
+		return false;
+
+	const uint64 titleId = static_cast<uint64>(m_game_list->GetItemData(selection));
+	if (titleId == 0)
+		return false;
+
+	TitleInfo info;
+	if (!CafeTitleList::GetFirstByTitleId(titleId, info))
+		return false;
+	if (!info.IsValid())
+		return false;
+
+	outPath = info.GetPath();
+	outTitleId = titleId;
+	return !outPath.empty();
 }
 
 bool MainWindow::FileLoad(const fs::path launchPath, wxLaunchGameEvent::INITIATED_BY initiatedBy)
@@ -1462,15 +1660,15 @@ void MainWindow::OnSetWindowTitle(wxCommandEvent& event)
 void MainWindow::OnKeyUp(wxKeyEvent& event)
 {
 	event.Skip();
-
-	if (swkbd_hasKeyboardInputHook())
-		return;
-
-	HotkeySettings::CaptureInput(event);
 }
 
 void MainWindow::OnKeyDown(wxKeyEvent& event)
 {
+	if (!swkbd_hasKeyboardInputHook() && HotkeySettings::CaptureInput(event))
+	{
+		event.Skip(false);
+		return;
+	}
 #if defined(__APPLE__)
        // On macOS, allow Cmd+Q to quit the application
     if (event.CmdDown() && event.GetKeyCode() == 'Q')
@@ -1554,6 +1752,52 @@ void MainWindow::OnToolsInput(wxCommandEvent& event)
 				});
 			m_usb_devices->Show(true);
 		}
+		break;
+	}
+	case MAINFRAME_MENU_ID_TOOLS_TAS_TOOLS:
+	{
+		if (m_tas_tools_window)
+		{
+			m_tas_tools_window->Show(true);
+			m_tas_tools_window->Raise();
+			m_tas_tools_window->SetFocus();
+		}
+		else
+		{
+			m_tas_tools_window = new TasToolsWindow(this);
+			m_tas_tools_window->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& closeEvent)
+				{
+					m_tas_tools_window = nullptr;
+					closeEvent.Skip();
+				});
+			m_tas_tools_window->Show(true);
+		}
+		break;
+	}
+	case MAINFRAME_MENU_ID_TOOLS_TAS_INPUT_EDITOR:
+	{
+		if (m_tas_input_window)
+		{
+			m_tas_input_window->Show(true);
+			m_tas_input_window->Raise();
+			m_tas_input_window->SetFocus();
+		}
+		else
+		{
+			m_tas_input_window = new TasInputWindow(this);
+			m_tas_input_window->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& closeEvent)
+				{
+					m_tas_input_window = nullptr;
+					closeEvent.Skip();
+				});
+			m_tas_input_window->Show(true);
+		}
+		break;
+	}
+	case MAINFRAME_MENU_ID_TOOLS_TAS_HOTKEYS:
+	{
+		auto* frame = new HotkeySettings(this, HotkeySettings::Scope::TasOnly);
+		frame->Show(true);
 		break;
 	}
 	break;
@@ -1759,30 +2003,43 @@ void MainWindow::SetFullScreen(bool state)
 
 void MainWindow::EndEmulation() // unfinished - memory leaks and crashes after repeated use (after 3x usually)
 {
-	CafeSystem::ShutdownTitle();
-	DestroyCanvas();
-	m_game_launched = false;
-	m_launched_game_name.clear();
-	#ifdef ENABLE_DISCORD_RPC
-	if (m_discord)
-		m_discord->UpdatePresence(DiscordPresence::Idling, "");
-	#endif
+	static std::atomic_bool s_endEmulationInProgress{ false };
+	if (s_endEmulationInProgress.exchange(true, std::memory_order_acq_rel))
+		return;
 
-	if (GetConfig().disable_screensaver)
-		ScreenSaver::SetInhibit(false);
-
-	// close memory searcher if created
-	if (m_toolWindow)
+	try
 	{
-		m_toolWindow->Close();
-		m_toolWindow = nullptr;
-		m_memorySearcherMenuItem->Enable(false);
-	}
+		CafeSystem::ShutdownTitle();
+		DestroyCanvas();
+		m_game_launched = false;
+		m_launched_game_name.clear();
+		#ifdef ENABLE_DISCORD_RPC
+		if (m_discord)
+			m_discord->UpdatePresence(DiscordPresence::Idling, "");
+		#endif
 
-	RecreateMenu();
-	CreateGameListAndStatusBar();
-	DoLayout();
-	UpdateChildWindowTitleRunningState();
+		if (GetConfig().disable_screensaver)
+			ScreenSaver::SetInhibit(false);
+
+		// close memory searcher if created
+		if (m_toolWindow)
+		{
+			m_toolWindow->Close();
+			m_toolWindow = nullptr;
+			m_memorySearcherMenuItem->Enable(false);
+		}
+
+		RecreateMenu();
+		CreateGameListAndStatusBar();
+		DoLayout();
+		UpdateChildWindowTitleRunningState();
+	}
+	catch (...)
+	{
+		s_endEmulationInProgress.store(false, std::memory_order_release);
+		throw;
+	}
+	s_endEmulationInProgress.store(false, std::memory_order_release);
 }
 
 void MainWindow::SetMenuVisible(bool state)
@@ -2178,10 +2435,8 @@ void MainWindow::RecreateMenu()
 	}
 	else
 	{
-#ifdef CEMU_DEBUG_ASSERT
 		m_fileMenu->Append(MAINFRAME_MENU_ID_FILE_END_EMULATION, _("Close game"));
 		m_fileMenuSeparator1 = m_fileMenu->AppendSeparator();
-#endif
 	}
 
 	m_fileMenu->Append(MAINFRAME_MENU_ID_FILE_OPEN_CEMU_FOLDER, _("Open Cemu folder"));
@@ -2261,8 +2516,13 @@ void MainWindow::RecreateMenu()
 	toolsMenu->Append(MAINFRAME_MENU_ID_TOOLS_TITLE_MANAGER, _("&Title Manager"));
 	toolsMenu->Append(MAINFRAME_MENU_ID_TOOLS_DOWNLOAD_MANAGER, _("&Download Manager"));
 	toolsMenu->Append(MAINFRAME_MENU_ID_TOOLS_EMULATED_USB_DEVICES, _("&Emulated USB Devices"));
-
 	m_menuBar->Append(toolsMenu, _("&Tools"));
+
+	wxMenu* tasMenu = new wxMenu();
+	tasMenu->Append(MAINFRAME_MENU_ID_TOOLS_TAS_TOOLS, _("&TAS Tools"));
+	tasMenu->Append(MAINFRAME_MENU_ID_TOOLS_TAS_INPUT_EDITOR, _("&TAS Input Editor"));
+	tasMenu->Append(MAINFRAME_MENU_ID_TOOLS_TAS_HOTKEYS, _("&TAS Hotkeys"));
+	m_menuBar->Append(tasMenu, _("&TAS"));
 
 	// cpu timer speed menu
 	wxMenu* timerSpeedMenu = new wxMenu();
@@ -2475,3 +2735,4 @@ bool MainWindow::FullscreenEnabled() const
 {
 	return LaunchSettings::FullscreenEnabled().value_or(GetWxGUIConfig().fullscreen);
 }
+
