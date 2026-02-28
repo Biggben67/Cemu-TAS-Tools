@@ -305,6 +305,53 @@ namespace coreinit
         __OSUnlockScheduler();
 	}
 
+	void OSAlarm_RebuildHostAlarmsAfterStateLoadNoLock()
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		if (g_activeAlarms.empty())
+		{
+			cemuLog_log(LogType::Force, "Timeline alarm rebuild: no active alarms");
+			return;
+		}
+
+		std::vector<OSAlarm_t*> activeAlarmKeys;
+		activeAlarmKeys.reserve(g_activeAlarms.size());
+		for (const auto& it : g_activeAlarms)
+			activeAlarmKeys.emplace_back(it.first);
+
+		for (auto& it : g_activeAlarms)
+			OSHostAlarmDestroy(it.second);
+		g_activeAlarms.clear();
+		OSHostAlarm::Reset();
+
+		size_t rebuilt = 0;
+		size_t skipped = 0;
+		const uint64 currentTime = OSGetTime();
+		for (auto* alarm : activeAlarmKeys)
+		{
+			if (!alarm || !alarm->checkMagic())
+			{
+				++skipped;
+				continue;
+			}
+
+			uint64 nextTime = _swapEndianU64(alarm->nextTime);
+			const uint64 period = _swapEndianU64(alarm->period);
+			if (period != 0 && nextTime < currentTime)
+			{
+				const uint64 ticksSinceNext = currentTime - nextTime;
+				const uint64 periodsMissed = ticksSinceNext / period;
+				nextTime += (periodsMissed + 1ull) * period;
+				alarm->nextTime = _swapEndianU64(nextTime);
+			}
+
+			g_activeAlarms[alarm] = OSHostAlarmCreate(nextTime, period, __OSHostAlarmTriggered, nullptr);
+			++rebuilt;
+		}
+
+		cemuLog_log(LogType::Force, "Timeline alarm rebuild: rebuilt={} skipped={} currentTime={}", rebuilt, skipped, currentTime);
+	}
+
 	void _OSAlarmThread(PPCInterpreter_t* hCPU)
 	{
 		while( true )
@@ -372,3 +419,4 @@ namespace coreinit
 		coreinit::OSSetThreadName(g_alarmThread.GetPtr(), _g_alarmThreadName.GetPtr());
 	}
 }
+
