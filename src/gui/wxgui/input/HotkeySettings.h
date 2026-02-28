@@ -9,12 +9,18 @@ class HotkeyEntry;
 class HotkeySettings : public wxFrame
 {
 public:
+	enum class Scope
+	{
+		All,
+		TasOnly
+	};
+
 	static void Init(class MainWindow* mainWindow);
 
-	static void CaptureInput(wxKeyEvent& event);
+	static bool CaptureInput(wxKeyEvent& event);
 	static void CaptureInput(const ControllerState& currentState, const ControllerState& lastState);
 
-	HotkeySettings(wxWindow* parent);
+	HotkeySettings(wxWindow* parent, Scope scope = Scope::All);
 	~HotkeySettings();
 
 private:
@@ -24,7 +30,7 @@ private:
 	inline static std::unordered_map<uint16, std::function<void(void)>> s_controllerHotkeyToFuncMap{};
 	inline static auto& s_cfgHotkeys = GetWxGUIConfig().hotkeys;
 
-	wxPanel* m_panel;
+	wxScrolledWindow* m_panel;
 	wxFlexGridSizer* m_sizer;
 	wxButton* m_activeInputButton{ nullptr };
 	wxTimer* m_controllerTimer{ nullptr };
@@ -57,4 +63,6 @@ private:
 	void OnControllerHotkeyInputRightClick(wxMouseEvent& event);
 	void OnKeyUp(wxKeyEvent& event);
 	void OnControllerTimer(wxTimerEvent& event);
+	void OnClose(wxCloseEvent& event);
 };
+
