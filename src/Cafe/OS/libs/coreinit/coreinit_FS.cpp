@@ -3,6 +3,7 @@
 #include "Cafe/OS/libs/coreinit/coreinit_SystemInfo.h"
 #include "Cafe/OS/common/OSCommon.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
+#include "Cafe/OS/libs/coreinit/coreinit_Scheduler.h"
 #include "Cafe/OS/libs/coreinit/coreinit_FS.h"
 #include "Cafe/OS/libs/coreinit/coreinit_MessageQueue.h"
 #include "util/helpers/Semaphore.h"
@@ -13,6 +14,7 @@
 #include "coreinit_IPCBuf.h"
 #include "Cafe/CafeSystem.h"
 #include "Cafe/TitleList/TitleInfo.h"
+#include <vector>
 
 #define FS_CB_PLACEHOLDER_FINISHCMD (MPTR)(0xF122330E)
 
@@ -44,6 +46,180 @@ bool strcpy_whole(char* dst, size_t dstLength, const char* src)
 
 namespace coreinit
 {
+	FSA_RESULT FSAShimAllocateBuffer(MEMPTR<MEMPTR<iosu::fsa::FSAShimBuffer>> outBuffer);
+	FSA_RESULT FSAShimFreeBuffer(iosu::fsa::FSAShimBuffer* buffer);
+
+	std::mutex s_saveHandleTraceMutex;
+	std::unordered_map<uint32, std::string> s_saveFileHandleToPath;
+	std::unordered_map<uint32, std::string> s_saveFileHandleToMode;
+	std::unordered_map<uint32, uint32> s_saveFileHandleRemap;
+	std::mutex s_fsClientWorkingDirMutex;
+	std::unordered_map<FSClientBody_t*, std::string> s_fsClientWorkingDir;
+	std::mutex s_fsAsyncEpochMutex;
+	uint64 s_fsAsyncEpoch = 1;
+	std::unordered_map<FSCmdBlockBody*, uint64> s_fsCmdEpoch;
+	// Deferred close on host-thread Timeline load caused handle-domain mismatches
+	// in later PPC IPC dispatch. Keep host-thread path non-destructive and rely on
+	// immediate handle invalidation + lazy reopen.
+
+	void TraceRememberSaveFileHandle(uint32 handle, const char* path, const char* mode)
+	{
+		if (handle == 0xFFFFFFFF || !path)
+			return;
+		std::scoped_lock lock(s_saveHandleTraceMutex);
+		s_saveFileHandleToPath[handle] = path;
+		if (mode)
+			s_saveFileHandleToMode[handle] = mode;
+		else
+			s_saveFileHandleToMode.erase(handle);
+	}
+
+	void TraceForgetSaveFileHandle(uint32 handle)
+	{
+		std::scoped_lock lock(s_saveHandleTraceMutex);
+		s_saveFileHandleToPath.erase(handle);
+		s_saveFileHandleToMode.erase(handle);
+		s_saveFileHandleRemap.erase(handle);
+		for (auto it = s_saveFileHandleRemap.begin(); it != s_saveFileHandleRemap.end();)
+		{
+			if (it->second == handle)
+				it = s_saveFileHandleRemap.erase(it);
+			else
+				++it;
+		}
+	}
+
+	bool TraceLookupSaveFileHandle(uint32 handle, std::string& pathOut, std::string& modeOut)
+	{
+		std::scoped_lock lock(s_saveHandleTraceMutex);
+		auto itPath = s_saveFileHandleToPath.find(handle);
+		if (itPath == s_saveFileHandleToPath.end())
+			return false;
+		pathOut = itPath->second;
+		auto itMode = s_saveFileHandleToMode.find(handle);
+		modeOut = (itMode != s_saveFileHandleToMode.end()) ? itMode->second : std::string();
+		return true;
+	}
+
+	void TraceClearSaveFileHandles()
+	{
+		std::scoped_lock lock(s_saveHandleTraceMutex);
+		s_saveFileHandleToPath.clear();
+		s_saveFileHandleToMode.clear();
+		s_saveFileHandleRemap.clear();
+	}
+
+	std::string NormalizePosixPath(const std::string& inputPath)
+	{
+		if (inputPath.empty())
+			return "/";
+		std::vector<std::string> parts;
+		size_t i = 0;
+		while (i < inputPath.size())
+		{
+			while (i < inputPath.size() && inputPath[i] == '/')
+				++i;
+			size_t j = i;
+			while (j < inputPath.size() && inputPath[j] != '/')
+				++j;
+			if (j == i)
+				break;
+			std::string part = inputPath.substr(i, j - i);
+			if (part == "." || part.empty())
+			{
+			}
+			else if (part == "..")
+			{
+				if (!parts.empty())
+					parts.pop_back();
+			}
+			else
+			{
+				parts.emplace_back(std::move(part));
+			}
+			i = j;
+		}
+		std::string normalized = "/";
+		for (size_t idx = 0; idx < parts.size(); ++idx)
+		{
+			if (idx != 0)
+				normalized += "/";
+			normalized += parts[idx];
+		}
+		return normalized;
+	}
+
+	void FSRememberClientWorkingDir(FSClientBody_t* client, const std::string& path)
+	{
+		if (!client)
+			return;
+		std::scoped_lock lock(s_fsClientWorkingDirMutex);
+		s_fsClientWorkingDir[client] = NormalizePosixPath(path);
+	}
+
+	std::string FSGetClientWorkingDir(FSClientBody_t* client)
+	{
+		std::scoped_lock lock(s_fsClientWorkingDirMutex);
+		auto it = s_fsClientWorkingDir.find(client);
+		if (it == s_fsClientWorkingDir.end())
+			return "/";
+		return it->second;
+	}
+
+	void FSForgetClientWorkingDir(FSClientBody_t* client)
+	{
+		if (!client)
+			return;
+		std::scoped_lock lock(s_fsClientWorkingDirMutex);
+		s_fsClientWorkingDir.erase(client);
+	}
+
+	std::string FSResolveClientPathAgainstCwd(FSClientBody_t* client, const char* path)
+	{
+		if (!path || !path[0])
+			return FSGetClientWorkingDir(client);
+		if (path[0] == '/')
+			return NormalizePosixPath(path);
+		const std::string cwd = FSGetClientWorkingDir(client);
+		if (cwd == "/")
+			return NormalizePosixPath(std::string("/") + path);
+		return NormalizePosixPath(cwd + "/" + path);
+	}
+
+	void FSAdvanceAsyncEpoch()
+	{
+		std::scoped_lock lock(s_fsAsyncEpochMutex);
+		++s_fsAsyncEpoch;
+		s_fsCmdEpoch.clear();
+	}
+
+	void FSRememberCmdEpoch(FSCmdBlockBody* cmd)
+	{
+		if (!cmd)
+			return;
+		std::scoped_lock lock(s_fsAsyncEpochMutex);
+		s_fsCmdEpoch[cmd] = s_fsAsyncEpoch;
+	}
+
+	bool FSIsCmdEpochCurrent(FSCmdBlockBody* cmd)
+	{
+		if (!cmd)
+			return false;
+		std::scoped_lock lock(s_fsAsyncEpochMutex);
+		auto it = s_fsCmdEpoch.find(cmd);
+		if (it == s_fsCmdEpoch.end())
+			return false;
+		return it->second == s_fsAsyncEpoch;
+	}
+
+	void FSForgetCmdEpoch(FSCmdBlockBody* cmd)
+	{
+		if (!cmd)
+			return;
+		std::scoped_lock lock(s_fsAsyncEpochMutex);
+		s_fsCmdEpoch.erase(cmd);
+	}
+
 	SysAllocator<OSMutex> s_fsGlobalMutex;
 
 	inline void FSLockMutex()
@@ -56,7 +232,30 @@ namespace coreinit
 		OSUnlockMutex(&s_fsGlobalMutex);
 	}
 
+	// Timeline helpers may run on a host thread with no active PPC instance.
+	// In that case OSLockMutex would crash (no current OSThread), so rely on
+	// the global scheduler lock that Timeline code already holds.
+	bool FSTryBeginTimelineSafeClientListAccess(bool& usedFsMutex)
+	{
+		usedFsMutex = (coreinit::OSGetCurrentThread() != nullptr);
+		if (usedFsMutex)
+		{
+			FSLockMutex();
+			return true;
+		}
+		if (!__OSHasSchedulerLock())
+			return false;
+		return true;
+	}
+
+	void FSEndTimelineSafeClientListAccess(bool usedFsMutex)
+	{
+		if (usedFsMutex)
+			FSUnlockMutex();
+	}
+
 	void _debugVerifyCommand(const char* stage, FSCmdBlockBody* fsCmdBlockBody);
+	FSA_RESULT FSAChangeDir(FSAClientHandle client, char* path);
 
 	bool sFSInitialized = true; // this should be false but it seems like some games rely on FSInit being called before main()? Twilight Princess for example reads files before it calls FSInit
 	bool sFSShutdown = false;
@@ -214,6 +413,150 @@ namespace coreinit
 	/* FS client management */
 	FSClientBody_t* g_fsRegisteredClientBodies = nullptr;
 
+	bool FSIsIdle()
+	{
+		bool usedFsMutex = false;
+		if (!FSTryBeginTimelineSafeClientListAccess(usedFsMutex))
+			return false;
+		FSClientBody_t* client = g_fsRegisteredClientBodies;
+		size_t safety = 0;
+		while (client)
+		{
+			if (client->currentCmdBlockBody != MPTR_NULL ||
+				client->fsCmdQueue.numCommandsInFlight != 0 ||
+				client->fsCmdQueue.first != MPTR_NULL ||
+				client->fsCmdQueue.last != MPTR_NULL)
+			{
+				FSEndTimelineSafeClientListAccess(usedFsMutex);
+				return false;
+			}
+			client = client->fsClientBodyNext.GetPtr();
+			if (++safety > 1024)
+			{
+				FSEndTimelineSafeClientListAccess(usedFsMutex);
+				return false;
+			}
+		}
+		FSEndTimelineSafeClientListAccess(usedFsMutex);
+		return true;
+	}
+
+	void FSCloseAllClientHandlesForTimelineLoad()
+	{
+		FSAdvanceAsyncEpoch();
+		bool usedFsMutex = false;
+		if (!FSTryBeginTimelineSafeClientListAccess(usedFsMutex))
+			return;
+		const bool hasPpcThreadContext = (coreinit::OSGetCurrentThread() != nullptr);
+		FSClientBody_t* client = g_fsRegisteredClientBodies;
+		size_t safety = 0;
+		size_t clientCount = 0;
+		size_t closedHandleCount = 0;
+		size_t droppedHandleCount = 0;
+		while (client)
+		{
+			IOSDevHandle devHandle = (IOSDevHandle)(uint32)client->iosuFSAHandle;
+			if (hasPpcThreadContext)
+			{
+				if (!IOS_ResultIsError((IOS_ERROR)devHandle))
+				{
+					IOS_Close(devHandle);
+					++closedHandleCount;
+				}
+			}
+			else if (!IOS_ResultIsError((IOS_ERROR)devHandle))
+			{
+				++droppedHandleCount;
+			}
+			client->iosuFSAHandle = (IOSDevHandle)-1;
+			++clientCount;
+
+			client = client->fsClientBodyNext.GetPtr();
+			if (++safety > 1024)
+				break;
+		}
+		FSEndTimelineSafeClientListAccess(usedFsMutex);
+		TraceClearSaveFileHandles();
+		cemuLog_log(LogType::Force, "coreinit_fs: Timeline handle invalidate complete clients={} closedHandles={} droppedHandles={} hasPpcThreadContext={}",
+			clientCount, closedHandleCount, droppedHandleCount, hasPpcThreadContext ? "true" : "false");
+	}
+
+	bool FSReopenAllClientHandlesAfterTimelineLoad()
+	{
+		bool usedFsMutex = false;
+		if (!FSTryBeginTimelineSafeClientListAccess(usedFsMutex))
+			return false;
+		const bool hasPpcThreadContext = (coreinit::OSGetCurrentThread() != nullptr);
+		FSClientBody_t* client = g_fsRegisteredClientBodies;
+		size_t safety = 0;
+		while (client)
+		{
+			if (hasPpcThreadContext)
+			{
+				IOSDevHandle devHandle = IOS_Open("/dev/fsa", 0);
+				if (IOS_ResultIsError((IOS_ERROR)devHandle))
+				{
+					FSEndTimelineSafeClientListAccess(usedFsMutex);
+					return false;
+				}
+				client->iosuFSAHandle = devHandle;
+			}
+			client = client->fsClientBodyNext.GetPtr();
+			if (++safety > 1024)
+			{
+				FSEndTimelineSafeClientListAccess(usedFsMutex);
+				return false;
+			}
+		}
+		FSEndTimelineSafeClientListAccess(usedFsMutex);
+		return true;
+	}
+
+	bool FSUnregisterClientForTimelineLoad(FSClient_t* fsClient)
+	{
+		if (!fsClient)
+			return false;
+		bool usedFsMutex = false;
+		if (!FSTryBeginTimelineSafeClientListAccess(usedFsMutex))
+			return false;
+
+		FSClientBody_t* target = __FSGetClientBody(fsClient);
+		FSClientBody_t* prev = nullptr;
+		FSClientBody_t* it = g_fsRegisteredClientBodies;
+		size_t safety = 0;
+		while (it)
+		{
+			if (it == target)
+			{
+				if (prev)
+					prev->fsClientBodyNext = it->fsClientBodyNext;
+				else
+					g_fsRegisteredClientBodies = it->fsClientBodyNext.GetPtr();
+
+				it->fsClientBodyNext = nullptr;
+				it->currentCmdBlockBody = nullptr;
+				it->fsCmdQueue.dequeueHandlerFuncMPTR = _swapEndianU32(MPTR_NULL);
+				it->fsCmdQueue.numCommandsInFlight = 0;
+				it->fsCmdQueue.numMaxCommandsInFlight = 1;
+				it->fsCmdQueue.queueFlags = {};
+				it->fsCmdQueue.first = nullptr;
+				it->fsCmdQueue.last = nullptr;
+				it->iosuFSAHandle = (IOSDevHandle)-1;
+				FSForgetClientWorkingDir(it);
+				TraceClearSaveFileHandles();
+				FSEndTimelineSafeClientListAccess(usedFsMutex);
+				return true;
+			}
+			prev = it;
+			it = it->fsClientBodyNext.GetPtr();
+			if (++safety > 1024)
+				break;
+		}
+
+		FSEndTimelineSafeClientListAccess(usedFsMutex);
+		return false;
+	}
+
 	sint32 FSGetClientNum()
 	{
 		sint32 clientNum = 0;
@@ -311,6 +654,7 @@ namespace coreinit
 			return FS_RESULT::FATAL_ERROR;
 		}
 		fsClientBody->iosuFSAHandle = devHandle;
+		FSRememberClientWorkingDir(fsClientBody, "/");
 
 		// add to list of registered clients
 		if (g_fsRegisteredClientBodies != MPTR_NULL)
@@ -342,6 +686,7 @@ namespace coreinit
 		FSClientBody_t* fsClientBody = __FSGetClientBody(fsClient);
 		FSLockMutex();
 		IOS_Close(fsClientBody->iosuFSAHandle);
+		FSForgetClientWorkingDir(fsClientBody);
 		// todo: wait till in-flight transactions are done
 		// remove from list
 		if (g_fsRegisteredClientBodies == fsClientBody)
@@ -511,10 +856,26 @@ namespace coreinit
 
 	void __FSQueueDefaultFinishFunc(FSCmdBlockBody* fsCmdBlockBody, FS_RESULT result)
 	{
+		auto isSavePath = [](const char* path) -> bool
+		{
+			return path && strncmp(path, "/vol/save/", 10) == 0;
+		};
+
 		switch ((FSA_CMD_OPERATION_TYPE)fsCmdBlockBody->fsaShimBuffer.operationType.value())
 		{
 		case FSA_CMD_OPERATION_TYPE::OPENFILE:
 		{
+			const char* path = reinterpret_cast<const char*>(fsCmdBlockBody->fsaShimBuffer.request.cmdOpenFile.path);
+			const char* mode = reinterpret_cast<const char*>(fsCmdBlockBody->fsaShimBuffer.request.cmdOpenFile.mode);
+			if (isSavePath(path))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs.OPENFILE done result={:08x} path='{}' mode='{}' outHandle={:08x}",
+					(uint32)result, path, mode, (uint32)fsCmdBlockBody->fsaShimBuffer.response.cmdOpenFile.fileHandleOutput);
+				if (result == FS_RESULT::SUCCESS)
+				{
+					TraceRememberSaveFileHandle((uint32)fsCmdBlockBody->fsaShimBuffer.response.cmdOpenFile.fileHandleOutput, path, mode);
+				}
+			}
 			*fsCmdBlockBody->returnValues.cmdOpenFile.handlePtr = fsCmdBlockBody->fsaShimBuffer.response.cmdOpenFile.fileHandleOutput;
 			break;
 		}
@@ -532,6 +893,12 @@ namespace coreinit
 
 		case FSA_CMD_OPERATION_TYPE::OPENDIR:
 		{
+			const char* path = reinterpret_cast<const char*>(fsCmdBlockBody->fsaShimBuffer.request.cmdOpenDir.path);
+			if (isSavePath(path))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs.OPENDIR done result={:08x} path='{}' outHandle={:08x}",
+					(uint32)result, path, (uint32)fsCmdBlockBody->fsaShimBuffer.response.cmdOpenDir.dirHandleOutput);
+			}
 			*fsCmdBlockBody->returnValues.cmdOpenDir.handlePtr = fsCmdBlockBody->fsaShimBuffer.response.cmdOpenDir.dirHandleOutput;
 			break;
 		}
@@ -548,10 +915,24 @@ namespace coreinit
 		case FSA_CMD_OPERATION_TYPE::GETSTATFILE:
 		{
 			*((FSStat_t*)fsCmdBlockBody->returnValues.cmdStatFile.resultPtr.GetPtr()) = fsCmdBlockBody->fsaShimBuffer.response.cmdStatFile.statOut;
+			const uint32 handle = (uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdGetStatFile.fileHandle;
+			std::string path;
+			std::string mode;
+			if (TraceLookupSaveFileHandle(handle, path, mode))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs.GETSTATFILE done result={:08x} handle={:08x} path='{}'",
+					(uint32)result, handle, path);
+			}
 			break;
 		}
 		case FSA_CMD_OPERATION_TYPE::QUERYINFO:
 		{
+			const char* query = reinterpret_cast<const char*>(fsCmdBlockBody->fsaShimBuffer.request.cmdQueryInfo.query);
+			if (isSavePath(query))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs.QUERYINFO done result={:08x} type={} query='{}'",
+					(uint32)result, (uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdQueryInfo.queryType, query);
+			}
 			if (fsCmdBlockBody->fsaShimBuffer.request.cmdQueryInfo.queryType == FSA_QUERY_TYPE_FREESPACE)
 			{
 				*((uint64be*)fsCmdBlockBody->returnValues.cmdQueryInfo.queryResultPtr.GetPtr()) = fsCmdBlockBody->fsaShimBuffer.response.cmdQueryInfo.queryFreeSpace.freespace;
@@ -567,19 +948,95 @@ namespace coreinit
 			break;
 		}
 		case FSA_CMD_OPERATION_TYPE::CHANGEDIR:
+		{
+			if (result == FS_RESULT::SUCCESS)
+			{
+				const char* reqPath = reinterpret_cast<const char*>(fsCmdBlockBody->fsaShimBuffer.request.cmdChangeDir.path);
+				const std::string resolved = FSResolveClientPathAgainstCwd(fsCmdBlockBody->fsClientBody.GetPtr(), reqPath);
+				FSRememberClientWorkingDir(fsCmdBlockBody->fsClientBody.GetPtr(), resolved);
+				cemuLog_log(LogType::Force, "coreinit_fs.CHANGEDIR done result={:08x} req='{}' resolved='{}'",
+					(uint32)result, reqPath ? reqPath : "<null>", resolved);
+			}
+			break;
+		}
 		case FSA_CMD_OPERATION_TYPE::MAKEDIR:
 		case FSA_CMD_OPERATION_TYPE::REMOVE:
 		case FSA_CMD_OPERATION_TYPE::RENAME:
 		case FSA_CMD_OPERATION_TYPE::CLOSEDIR:
-		case FSA_CMD_OPERATION_TYPE::READ:
-		case FSA_CMD_OPERATION_TYPE::WRITE:
-		case FSA_CMD_OPERATION_TYPE::SETPOS:
 		case FSA_CMD_OPERATION_TYPE::ISEOF:
-		case FSA_CMD_OPERATION_TYPE::CLOSEFILE:
 		case FSA_CMD_OPERATION_TYPE::APPENDFILE:
-		case FSA_CMD_OPERATION_TYPE::TRUNCATEFILE:
 		case FSA_CMD_OPERATION_TYPE::FLUSHQUOTA:
 		{
+			break;
+		}
+		case FSA_CMD_OPERATION_TYPE::READ:
+		{
+			const uint32 handle = (uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdReadFile.fileHandle;
+			std::string path;
+			std::string mode;
+			if (TraceLookupSaveFileHandle(handle, path, mode))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs.READ done result={:08x} handle={:08x} path='{}' size={} count={} pos={} flags={:08x}",
+					(uint32)result, handle, path,
+					(uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdReadFile.size,
+					(uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdReadFile.count,
+					(uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdReadFile.filePos,
+					(uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdReadFile.flag);
+			}
+			break;
+		}
+		case FSA_CMD_OPERATION_TYPE::WRITE:
+		{
+			const uint32 handle = (uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdWriteFile.fileHandle;
+			std::string path;
+			std::string mode;
+			if (TraceLookupSaveFileHandle(handle, path, mode))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs.WRITE done result={:08x} handle={:08x} path='{}' size={} count={} pos={} flags={:08x}",
+					(uint32)result, handle, path,
+					(uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdWriteFile.size,
+					(uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdWriteFile.count,
+					(uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdWriteFile.filePos,
+					(uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdWriteFile.flag);
+			}
+			break;
+		}
+		case FSA_CMD_OPERATION_TYPE::SETPOS:
+		{
+			const uint32 handle = (uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdSetPosFile.fileHandle;
+			std::string path;
+			std::string mode;
+			if (TraceLookupSaveFileHandle(handle, path, mode))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs.SETPOS done result={:08x} handle={:08x} path='{}' pos={}",
+					(uint32)result, handle, path,
+					(uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdSetPosFile.filePos);
+			}
+			break;
+		}
+		case FSA_CMD_OPERATION_TYPE::CLOSEFILE:
+		{
+			const uint32 handle = (uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdCloseFile.fileHandle;
+			std::string path;
+			std::string mode;
+			if (TraceLookupSaveFileHandle(handle, path, mode))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs.CLOSEFILE done result={:08x} handle={:08x} path='{}'",
+					(uint32)result, handle, path);
+			}
+			TraceForgetSaveFileHandle(handle);
+			break;
+		}
+		case FSA_CMD_OPERATION_TYPE::TRUNCATEFILE:
+		{
+			const uint32 handle = (uint32)fsCmdBlockBody->fsaShimBuffer.request.cmdTruncateFile.fileHandle;
+			std::string path;
+			std::string mode;
+			if (TraceLookupSaveFileHandle(handle, path, mode))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs.TRUNCATEFILE done result={:08x} handle={:08x} path='{}'",
+					(uint32)result, handle, path);
+			}
 			break;
 		}
 		default:
@@ -602,6 +1059,7 @@ namespace coreinit
 		fsCmdBlockBody->cmdFinishFuncMPTR = finishCmdFunc;
 		FSLockMutex();
 		fsCmdBlockBody->statusCode = _swapEndianU32(FSA_CMD_STATUS_CODE_D900A22);
+		FSRememberCmdEpoch(fsCmdBlockBody);
 		__FSQueueCmdByPriority(cmdQueue, fsCmdBlockBody, true);
 		FSUnlockMutex();
 		__FSUpdateQueue(cmdQueue);
@@ -712,12 +1170,58 @@ namespace coreinit
 			FSCmdBlock_t* fsCmdBlock = fsCmdBlockBody->asyncResult.fsCmdBlock.GetPtr();
 			PPCCoreCallback(fsCmdBlockBody->asyncResult.fsAsyncParamsNew.userCallback, fsClient, fsCmdBlock, (sint32)result, fsCmdBlockBody->asyncResult.fsAsyncParamsNew.userContext);
 		}
+		FSForgetCmdEpoch(fsCmdBlockBody);
 	}
 
 	void __FSAIoctlResponseCallback(PPCInterpreter_t* hCPU)
 	{
 		ppcDefineParamU32(iosResult, 0);
 		ppcDefineParamPtr(cmd, FSCmdBlockBody, 1);
+
+		if (cmd == nullptr)
+		{
+			cemuLog_log(LogType::Force, "coreinit_fs: dropped async callback with null cmd");
+			osLib_returnFromFunction(hCPU, 0);
+			return;
+		}
+
+		FSClientBody_t* client = cmd->fsClientBody;
+		if (client == nullptr)
+		{
+			cemuLog_log(LogType::Force, "coreinit_fs: dropped async callback with null client cmd=0x{:08x}",
+				memory_getVirtualOffsetFromPointer(cmd));
+			osLib_returnFromFunction(hCPU, 0);
+			return;
+		}
+
+		const uint32 statusCode = _swapEndianU32(cmd->statusCode);
+		if (statusCode != FSA_CMD_STATUS_CODE_D900A22)
+		{
+			cemuLog_log(LogType::Force, "coreinit_fs: dropped stale async callback cmd=0x{:08x} status={:08x}",
+				memory_getVirtualOffsetFromPointer(cmd), statusCode);
+			osLib_returnFromFunction(hCPU, 0);
+			return;
+		}
+
+		const IOSDevHandle requestHandle = cmd->fsaShimBuffer.fsaDevHandle;
+		const IOSDevHandle activeHandle = client->iosuFSAHandle;
+		if (requestHandle != activeHandle)
+		{
+			cemuLog_log(LogType::Force, "coreinit_fs: dropped async callback with stale handle cmd=0x{:08x} requestHandle={:08x} activeHandle={:08x}",
+				memory_getVirtualOffsetFromPointer(cmd), (uint32)requestHandle, (uint32)activeHandle);
+			FSForgetCmdEpoch(cmd);
+			osLib_returnFromFunction(hCPU, 0);
+			return;
+		}
+
+		if (!FSIsCmdEpochCurrent(cmd))
+		{
+			cemuLog_log(LogType::Force, "coreinit_fs: dropped async callback from stale epoch cmd=0x{:08x}",
+				memory_getVirtualOffsetFromPointer(cmd));
+			FSForgetCmdEpoch(cmd);
+			osLib_returnFromFunction(hCPU, 0);
+			return;
+		}
 
 		FSA_RESULT fsaStatus = _FSIosErrorToFSAStatus((IOS_ERROR)iosResult);
 
@@ -728,7 +1232,6 @@ namespace coreinit
 		FS_RESULT fsStatus = _FSAStatusToFSStatus(fsaStatus);
 
 		// On actual hardware this delegates the processing to the AppIO threads, but for now we just run it directly from the IPC thread
-		FSClientBody_t* client = cmd->fsClientBody;
 		FSCmdQueue& cmdQueue = client->fsCmdQueue;
 		FSLockMutex();
 		cmdQueue.numCommandsInFlight -= 1;
@@ -804,6 +1307,27 @@ namespace coreinit
 		fsCmdBlockBody->errHandling = _swapEndianU32(errHandling);
 		fsCmdBlockBody->uknStatusGuessed09E9 = 0;
 		fsCmdBlockBody->cancelState &= ~(1 << 0); // clear cancel bit
+		if (IOS_ResultIsError((IOS_ERROR)(IOSDevHandle)(uint32)fsClientBody->iosuFSAHandle))
+		{
+			IOSDevHandle devHandle = IOS_Open("/dev/fsa", 0);
+			if (IOS_ResultIsError((IOS_ERROR)devHandle))
+			{
+				cemuLog_log(LogType::Force, "coreinit_fs: lazy FSA reopen failed client=0x{:08x}",
+					memory_getVirtualOffsetFromPointer(fsClientBody->selfClient.GetPtr()));
+				return -0x400;
+			}
+			fsClientBody->iosuFSAHandle = devHandle;
+			const std::string restoredCwd = FSGetClientWorkingDir(fsClientBody);
+			if (restoredCwd != "/")
+			{
+				FSA_RESULT cwdResult = FSAChangeDir((FSAClientHandle)devHandle, (char*)restoredCwd.c_str());
+				cemuLog_log(LogType::Force, "coreinit_fs: lazy FSA reopen cwd restore client=0x{:08x} cwd='{}' result={:08x}",
+					memory_getVirtualOffsetFromPointer(fsClientBody->selfClient.GetPtr()), restoredCwd, (uint32)cwdResult);
+			}
+			cemuLog_log(LogType::Force, "coreinit_fs: lazy FSA reopen ok client=0x{:08x} handle={:08x}",
+				memory_getVirtualOffsetFromPointer(fsClientBody->selfClient.GetPtr()),
+				(uint32)devHandle);
+		}
 		fsCmdBlockBody->fsaShimBuffer.fsaDevHandle = fsClientBody->iosuFSAHandle;
 		__FSPrepareCmdAsyncResult(fsClientBody, fsCmdBlockBody, &fsCmdBlockBody->asyncResult, fsAsyncParams);
 		return 0;
@@ -904,6 +1428,67 @@ namespace coreinit
 		return FSA_RESULT::OK;
 	}
 
+	bool FSTryTranslateOrRecoverSaveFileHandle(FSClientBody_t* fsClientBody, uint32 inHandle, uint32& outHandle)
+	{
+		outHandle = inHandle;
+		std::string path;
+		std::string mode;
+		{
+			std::scoped_lock lock(s_saveHandleTraceMutex);
+			auto itRemap = s_saveFileHandleRemap.find(inHandle);
+			if (itRemap != s_saveFileHandleRemap.end())
+			{
+				outHandle = itRemap->second;
+				return true;
+			}
+			auto itPath = s_saveFileHandleToPath.find(inHandle);
+			if (itPath == s_saveFileHandleToPath.end())
+				return false;
+			path = itPath->second;
+			auto itMode = s_saveFileHandleToMode.find(inHandle);
+			mode = (itMode != s_saveFileHandleToMode.end()) ? itMode->second : "r";
+		}
+
+		if (!fsClientBody)
+			return false;
+		const IOSDevHandle fsaHandle = fsClientBody->iosuFSAHandle;
+		if (IOS_ResultIsError((IOS_ERROR)fsaHandle))
+			return false;
+
+		StackAllocator<MEMPTR<iosu::fsa::FSAShimBuffer>, 1> shimBuffer;
+		FSA_RESULT openResult = FSAShimAllocateBuffer(shimBuffer.GetPointer());
+		if (openResult != FSA_RESULT::OK)
+			return false;
+
+		uint32 recoveredHandle = 0xFFFFFFFF;
+		openResult = __FSPrepareCmd_OpenFile(shimBuffer->GetPtr(), fsaHandle, (char*)path.c_str(), (char*)mode.c_str(), 0x660, 0, 0);
+		if (openResult == FSA_RESULT::OK)
+		{
+			openResult = __FSAIPCSubmitCommand(shimBuffer->GetPtr());
+			if (openResult == FSA_RESULT::OK)
+				recoveredHandle = (uint32)shimBuffer->GetPtr()->response.cmdOpenFile.fileHandleOutput;
+		}
+		FSAShimFreeBuffer(shimBuffer->GetPtr());
+
+		if (openResult != FSA_RESULT::OK || recoveredHandle == 0xFFFFFFFF)
+		{
+			cemuLog_log(LogType::Force, "coreinit_fs: save-handle recover failed old={:08x} path='{}' mode='{}' result={:08x}",
+				inHandle, path, mode, (uint32)openResult);
+			return false;
+		}
+
+		{
+			std::scoped_lock lock(s_saveHandleTraceMutex);
+			s_saveFileHandleRemap[inHandle] = recoveredHandle;
+			s_saveFileHandleToPath[recoveredHandle] = path;
+			s_saveFileHandleToMode[recoveredHandle] = mode;
+		}
+		cemuLog_log(LogType::Force, "coreinit_fs: recovered stale save handle old={:08x} -> new={:08x} path='{}' mode='{}'",
+			inHandle, recoveredHandle, path, mode);
+		outHandle = recoveredHandle;
+		return true;
+	}
+
 	sint32 FSOpenFileAsync(FSClient_t* fsClient, FSCmdBlock_t* fsCmdBlock, char* path, char* mode, FSFileHandlePtr outFileHandle, uint32 errorMask, FSAsyncParams* fsAsyncParams)
 	{
 		_FSCmdIntro();
@@ -971,8 +1556,12 @@ namespace coreinit
 	sint32 FSCloseFileAsync(FSClient_t* fsClient, FSCmdBlock_t* fsCmdBlock, uint32 fileHandle, uint32 errorMask, FSAsyncParams* fsAsyncParams)
 	{
 		_FSCmdIntro();
+		uint32 translatedHandle = fileHandle;
+		FSTryTranslateOrRecoverSaveFileHandle(fsClientBody, fileHandle, translatedHandle);
+		if (translatedHandle != fileHandle)
+			TraceForgetSaveFileHandle(fileHandle);
 
-		FSA_RESULT prepareResult = __FSPrepareCmd_CloseFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, fileHandle);
+		FSA_RESULT prepareResult = __FSPrepareCmd_CloseFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, translatedHandle);
 		if (prepareResult != FSA_RESULT::OK)
 			return (FSStatus)_FSAStatusToFSStatus(prepareResult);
 
@@ -1005,8 +1594,10 @@ namespace coreinit
 	sint32 FSFlushFileAsync(FSClient_t* fsClient, FSCmdBlock_t* fsCmdBlock, uint32 fileHandle, uint32 errorMask, FSAsyncParams* fsAsyncParams)
 	{
 		_FSCmdIntro();
+		uint32 translatedHandle = fileHandle;
+		FSTryTranslateOrRecoverSaveFileHandle(fsClientBody, fileHandle, translatedHandle);
 
-		FSA_RESULT prepareResult = __FSPrepareCmd_FlushFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, fileHandle);
+		FSA_RESULT prepareResult = __FSPrepareCmd_FlushFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, translatedHandle);
 		if (prepareResult != FSA_RESULT::OK)
 			return (FSStatus)_FSAStatusToFSStatus(prepareResult);
 
@@ -1061,6 +1652,8 @@ namespace coreinit
 	sint32 __FSReadFileAsyncEx(FSClient_t* fsClient, FSCmdBlock_t* fsCmdBlock, void* dest, uint32 size, uint32 count, bool usePos, uint32 filePos, uint32 fileHandle, uint32 flag, uint32 errorMask, FSAsyncParams* fsAsyncParams)
 	{
 		_FSCmdIntro();
+		uint32 translatedHandle = fileHandle;
+		FSTryTranslateOrRecoverSaveFileHandle(fsClientBody, fileHandle, translatedHandle);
 		if (size == 0 || count == 0 || dest == NULL)
 			dest = _tempFSSpace.GetPtr();
 		sint64 transferSizeS64 = (sint64)size * (sint64)count;
@@ -1081,7 +1674,7 @@ namespace coreinit
 		else
 			flag &= ~FSA_CMD_FLAG_SET_POS;
 
-		FSA_RESULT prepareResult = __FSPrepareCmd_ReadFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, dest, size, count, filePos, fileHandle, flag);
+		FSA_RESULT prepareResult = __FSPrepareCmd_ReadFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, dest, size, count, filePos, translatedHandle, flag);
 		if (prepareResult != FSA_RESULT::OK)
 			return (FSStatus)_FSAStatusToFSStatus(prepareResult);
 
@@ -1155,6 +1748,8 @@ namespace coreinit
 	sint32 __FSWriteFileWithPosAsync(FSClient_t* fsClient, FSCmdBlock_t* fsCmdBlock, void* dest, uint32 size, uint32 count, bool useFilePos, uint32 filePos, uint32 fileHandle, uint32 flag, uint32 errorMask, FSAsyncParams* fsAsyncParams)
 	{
 		_FSCmdIntro();
+		uint32 translatedHandle = fileHandle;
+		FSTryTranslateOrRecoverSaveFileHandle(fsClientBody, fileHandle, translatedHandle);
 		if (size == 0 || count == 0 || dest == nullptr)
 			dest = _tempFSSpace.GetPtr();
 		sint64 transferSizeS64 = (sint64)size * (sint64)count;
@@ -1175,7 +1770,7 @@ namespace coreinit
 		else
 			flag &= ~FSA_CMD_FLAG_SET_POS;
 
-		FSA_RESULT prepareResult = __FSPrepareCmd_WriteFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, dest, size, count, filePos, fileHandle, flag);
+		FSA_RESULT prepareResult = __FSPrepareCmd_WriteFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, dest, size, count, filePos, translatedHandle, flag);
 		if (prepareResult != FSA_RESULT::OK)
 			return (FSStatus)_FSAStatusToFSStatus(prepareResult);
 
@@ -1225,7 +1820,9 @@ namespace coreinit
 	sint32 FSSetPosFileAsync(FSClient_t* fsClient, FSCmdBlock_t* fsCmdBlock, uint32 fileHandle, uint32 filePos, uint32 errorMask, FSAsyncParams* fsAsyncParams)
 	{
 		_FSCmdIntro();
-		FSA_RESULT prepareResult = __FSPrepareCmd_SetPosFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, fileHandle, filePos);
+		uint32 translatedHandle = fileHandle;
+		FSTryTranslateOrRecoverSaveFileHandle(fsClientBody, fileHandle, translatedHandle);
+		FSA_RESULT prepareResult = __FSPrepareCmd_SetPosFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, translatedHandle, filePos);
 		if (prepareResult != FSA_RESULT::OK)
 			return (FSStatus)_FSAStatusToFSStatus(prepareResult);
 		__FSQueueCmd(&fsClientBody->fsCmdQueue, fsCmdBlockBody, RPLLoader_MakePPCCallable(export___FSQueueDefaultFinishFunc));
@@ -1257,7 +1854,9 @@ namespace coreinit
 		// games using this: Darksiders Warmastered Edition
 		_FSCmdIntro();
 		fsCmdBlockBody->returnValues.cmdGetPosFile.filePosPtr = returnedFilePos;
-		FSA_RESULT prepareResult = __FSPrepareCmd_GetPosFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, fileHandle);
+		uint32 translatedHandle = fileHandle;
+		FSTryTranslateOrRecoverSaveFileHandle(fsClientBody, fileHandle, translatedHandle);
+		FSA_RESULT prepareResult = __FSPrepareCmd_GetPosFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, translatedHandle);
 		if (prepareResult != FSA_RESULT::OK)
 			return (FSStatus)_FSAStatusToFSStatus(prepareResult);
 		__FSQueueCmd(&fsClientBody->fsCmdQueue, fsCmdBlockBody, RPLLoader_MakePPCCallable(export___FSQueueDefaultFinishFunc));
@@ -1464,7 +2063,9 @@ namespace coreinit
 	sint32 FSTruncateFileAsync(FSClient_t* fsClient, FSCmdBlock_t* fsCmdBlock, FSFileHandle2 fileHandle, uint32 errorMask, FSAsyncParams* fsAsyncParams)
 	{
 		_FSCmdIntro();
-		FSA_RESULT prepareResult = __FSPrepareCmd_TruncateFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, fileHandle);
+		uint32 translatedHandle = fileHandle;
+		FSTryTranslateOrRecoverSaveFileHandle(fsClientBody, fileHandle, translatedHandle);
+		FSA_RESULT prepareResult = __FSPrepareCmd_TruncateFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, translatedHandle);
 		if (prepareResult != FSA_RESULT::OK)
 			return (FSStatus)_FSAStatusToFSStatus(prepareResult);
 
@@ -1854,8 +2455,10 @@ namespace coreinit
 		_FSCmdIntro();
 		cemu_assert(statOut); // statOut must not be null
 		fsCmdBlockBody->returnValues.cmdStatFile.resultPtr = statOut;
+		uint32 translatedHandle = fileHandle;
+		FSTryTranslateOrRecoverSaveFileHandle(fsClientBody, fileHandle, translatedHandle);
 
-		FSA_RESULT prepareResult = __FSPrepareCmd_GetStatFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, fileHandle);
+		FSA_RESULT prepareResult = __FSPrepareCmd_GetStatFile(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, translatedHandle);
 		if (prepareResult != FSA_RESULT::OK)
 			return (FSStatus)_FSAStatusToFSStatus(prepareResult);
 
@@ -1904,8 +2507,10 @@ namespace coreinit
 	{
 		// used by Paper Monsters Recut
 		_FSCmdIntro();
+		uint32 translatedHandle = fileHandle;
+		FSTryTranslateOrRecoverSaveFileHandle(fsClientBody, fileHandle, translatedHandle);
 
-		FSA_RESULT prepareResult = __FSPrepareCmd_IsEof(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, fileHandle);
+		FSA_RESULT prepareResult = __FSPrepareCmd_IsEof(&fsCmdBlockBody->fsaShimBuffer, fsClientBody->iosuFSAHandle, translatedHandle);
 		if (prepareResult != FSA_RESULT::OK)
 			return (FSStatus)_FSAStatusToFSStatus(prepareResult);
 
@@ -2775,3 +3380,4 @@ namespace coreinit
 		g_fsRegisteredClientBodies = nullptr;
 	}
 } // namespace coreinit
+
